@@ -1,0 +1,9 @@
+{"allocations": [
+  {"symbol": "SOLUSDT", "direction": "long", "desk": "momentum", "conviction": 0.78,
+   "risk_budget_frac": 1.0, "entry_style": "market",
+   "thesis": "Confirmed risk-on; ADX 38 squeeze-long with crowded shorts paying funding, Carry confirms the receive-side. Highest-conviction with-regime trend — ride it.",
+   "falsifiable_prediction": "Holds above 168.5 and makes a higher high within 2 cycles; invalidated by a 4h close below 159."}
+],
+ "intraday_budget_frac": 0.4,
+ "hot_list": ["SOLUSDT", "ETHUSDT", "BTCUSDT"],
+ "flat_verdicts": [{"symbol": "DOGEUSDT", "reason": "Flush-short edge present but no defined-risk entry yet; armed a trigger instead of allocating budget."}]}

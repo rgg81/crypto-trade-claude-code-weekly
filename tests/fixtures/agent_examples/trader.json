@@ -1,0 +1,5 @@
+{"symbol": "BTCUSDT", "direction": "long", "entry": 73500.0, "stop": 71800.0,
+ "take_profits": [77300.0], "atr": 850.0, "confidence": 0.7, "horizon_hours": 8,
+ "rationale": "long per CIO allocation; 2x ATR stop (1700), first TP at ~2.24R; entry on confirmation of trend continuation",
+ "confirmation": true, "risk_mult": 1.0,
+ "falsifiable_prediction": "holds above 71800 and makes a higher high within 2 cycles; invalidated by a 4h close below 71800"}

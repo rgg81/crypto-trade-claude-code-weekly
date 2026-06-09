@@ -1,0 +1,9 @@
+{"reports": [
+  {"agent": "sentiment", "symbol": "ZECUSDT", "stance": "bullish", "confidence": 0.55,
+   "key_points": ["F&G 8 (Extreme Fear) — market-wide capitulation, contrarian-constructive",
+                  "reddit: ZEC mentions spiking with despair/'is it dead?' tone after the bug — washed-out, not euphoric; sentiment-bottom characteristic",
+                  "macro feed down — no DXY/yields read, conviction capped"],
+   "signals": {"fear_greed": 8, "social_mentions": 6, "social_tone": "despair",
+               "crowd_position": "capitulation", "dxy_trend": 0, "ust_10y": null,
+               "macro_event_risk": false}}
+]}

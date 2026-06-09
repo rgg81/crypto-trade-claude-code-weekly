@@ -1,0 +1,8 @@
+{"reports": [
+  {"agent": "momentum", "symbol": "SOLUSDT", "stance": "bullish", "confidence": 0.74,
+   "key_points": ["ADX 38 with stacked EMAs, momentum_20 accelerating",
+                  "L/S 0.79 + funding -0.012% = crowded shorts paying",
+                  "Broke the 4h swing_high on rising OI (+9%) — new longs, not covering"],
+   "signals": {"setup_type": "squeeze_long", "trigger_level": 168.5, "invalidation": 159.0,
+               "expected_R": 2.8, "adx": 38.0, "oi_change": 0.09, "long_short_ratio": 0.79}}
+]}

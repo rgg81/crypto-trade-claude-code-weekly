@@ -1,0 +1,21 @@
+# Runtime state & secrets — never commit
+state/
+# desk's episodic journal/lessons — runtime state, regenerated per run
+memory/
+.env
+*.key
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+
+# OS / editor
+.DS_Store
+*.swp
+
+# Claude Code local session state
+.claude/

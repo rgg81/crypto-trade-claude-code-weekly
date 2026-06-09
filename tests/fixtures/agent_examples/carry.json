@@ -1,0 +1,8 @@
+{"reports": [
+  {"agent": "carry", "symbol": "BTCUSDT", "stance": "bearish", "confidence": 0.66,
+   "key_points": ["Funding +0.05%/8h (~55% annualized) — crowded longs paying richly",
+                  "L/S 1.31 confirms crowded-long; OI rising into a twice-rejected level",
+                  "4h structure stalling below resistance — carry short isn't fighting a trend"],
+   "signals": {"funding_rate": 0.0005, "long_short_ratio": 1.31, "expected_carry_per_cycle": 0.0015,
+               "hold_horizon_hours": 24.0, "basis_bps": 18.0}}
+]}

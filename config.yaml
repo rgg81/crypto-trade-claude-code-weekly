@@ -1,0 +1,52 @@
+# Operation TEMPEST-WEEKLY — non-secret runtime config. Secrets come from env (.env), never here.
+# AGGRESSIVE PAPER desk: target 5%/WEEK, ~50% drawdown tolerance, dual-loop (fast 15m + strategic 1h).
+account_size_usdt: 10000.0
+timeframe: "4h"            # regime ANCHOR timeframe (authoritative regime read is taken on 4h)
+symbol_count: 12
+deep_model: "opus"
+quick_model: "haiku"
+verdict_horizon_weeks: 8
+target_weekly: 0.05        # 5%/week mandate (drives the pacing engine)
+max_drawdown_tolerance: 0.50  # -50% hard force-flatten breaker
+# Dual-loop cadence: a fast intraday scalp loop + a strategic trend/swing loop on ONE paper account.
+loops:
+  fast:
+    timeframe: "15m"
+    quick_model: "haiku"
+    deep_model: "sonnet"
+    poll_minutes: 5
+  strategic:
+    timeframe: "4h"
+    regime_timeframe: "4h"
+    quick_model: "sonnet"
+    deep_model: "opus"
+    poll_minutes: 5
+# Per-AGENT model (resolved at dispatch; overrides the loop tier). RULE: every agent that DECIDES
+# money runs on OPUS; only operational agents (narrating deterministic logic) run cheaper.
+# `scalper` is OPUS but GATED — dispatched only when the CIO granted intraday budget + a hot-list,
+# so Opus doesn't fire on every quiet 15m candle (the exit-sweep still runs every fire, for free).
+agent_models:
+  cio: "opus"
+  trader: "opus"
+  momentum: "opus"
+  carry: "opus"
+  news: "opus"
+  sentiment: "opus"
+  scalper: "opus"
+  reflector: "opus"
+  pace_officer: "sonnet"
+# live: false => PAPER, FOREVER for this desk. Real mainnet market data (public, keyless), simulated
+# execution with realistic fees/funding/slippage/liquidation. The universe is selected dynamically
+# each cycle; `symbols` is only a cold-start fallback. Never flip live to true.
+live: false
+exchange:
+  testnet: false
+  key_env: "BINANCE_KEY"
+  secret_env: "BINANCE_SECRET"
+data:
+  news_rss_sources:
+    - "https://www.coindesk.com/arc/outboundfeeds/rss/?outputType=xml"
+    - "https://cointelegraph.com/rss"
+  fred_key_env: "FRED_API_KEY"
+  fred_series: ["DTWEXBGS", "DGS10", "FEDFUNDS", "CPIAUCSL"]
+  archive_dir: "state/archive"
