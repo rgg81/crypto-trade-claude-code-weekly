@@ -20,6 +20,7 @@ from futures_fund.cycle import (
 )
 from futures_fund.hitrate import hit_rate
 from futures_fund.memory_layout import ensure_memory_layout
+from futures_fund.neutral_book import presize_and_balance
 from futures_fund.portfolio import portfolio_health
 from futures_fund.reduce import reduce_position
 from futures_fund.reflect import reflection_payload
@@ -181,17 +182,17 @@ def preflight_step(exchange, settings: Settings, state_dir, memory_dir,
                     build_scorecard(state_dir, memory_dir), exposure)}
     health = portfolio_health(account.balance, account.peak_equity, positions, ctx.prices,
                               recent_hit_rate=hit_rate(memory_dir, _AGENT_KEY))
-    scorecard = _with_exposure_warning(build_scorecard(state_dir, memory_dir, weekly_target=0.05),
+    scorecard = _with_exposure_warning(build_scorecard(state_dir, memory_dir, monthly_target=0.03),
                                        exposure)
-    # Pillar 1 DEPLOY: week-to-date risk pacing — surfaces a deploy directive (soft/normal/press/
-    # throttle) the team reads to actively pursue 5%/week. Advisory/utilization-only;
+    # Pillar 1 DEPLOY: month-to-date risk pacing — surfaces a deploy directive (soft/normal/press/
+    # throttle) the team reads to pursue ~3%/month on the balanced book. Advisory/utilization-only;
     # anti-martingale (drawdown never presses); the gate's protected caps are unchanged. Fail-safe
     # -> soft on error.
     try:
         from futures_fund.pacing import pacing_state
-        _ps = pacing_state(state_dir, now, health, weekly_target=0.05)
+        _ps = pacing_state(state_dir, now, health, monthly_target=0.03)
         pacing = {"mode": _ps.mode, "appetite": _ps.appetite,
-                  "suggested_risk_mult": _ps.suggested_risk_mult, "wtd_return": _ps.wtd_return,
+                  "suggested_risk_mult": _ps.suggested_risk_mult, "mtd_return": _ps.mtd_return,
                   "pace": _ps.pace, "pace_gap": _ps.pace_gap, "in_drawdown": _ps.in_drawdown,
                   "directive": _ps.directive}
     except Exception:  # noqa: BLE001 — pacing is advisory; never break the cycle
@@ -246,6 +247,29 @@ def preflight_step(exchange, settings: Settings, state_dir, memory_dir,
             archive_jsonl(f"{settings.data.archive_dir}/derivatives.jsonl", [rec], key="ts")
     except Exception:
         pass  # graceful: archiving must never break the cycle
+    regime_state = _classify_regime_safe(state_dir, market_context, briefs, now, cycle_no)
+    # SELF-LEARNING: inject the regime-relevant, READ-GATED, two-sided lesson corpus as
+    # JUDGMENT-ONLY priors — validated standing RULEs + candidates proven enough to advise, each
+    # HONESTLY tagged (RULE vs CANDIDATE—unproven). The deterministic gate NEVER reads these; they
+    # shape agent judgment only. Fail-safe -> [] so a learning bug can never break trading.
+    lessons: list[dict] = []
+    try:
+        from futures_fund.lessons import format_lesson, retrieve_lessons
+        _rl = (regime_state or {}).get("regime")
+        for z in retrieve_lessons(memory_dir, now, _rl, query_tags=[_rl or "any"], k=6):
+            lessons.append({"text": format_lesson(z), "polarity": z.polarity, "state": z.state,
+                            "importance": z.importance, "regime": z.regime, "id": z.id})
+    except Exception:  # noqa: BLE001 — learning is advisory; never break the cycle
+        lessons = []
+    # TIER-1 EPISODIC recall (anti-press tail-risk brake): the desk's WORST realised outcomes per
+    # (regime x desk x direction) fingerprint, most-dangerous first. DESCRIPTIVE only (no rule, no
+    # gate). Surfaced so the desks weight the realised downside before pressing. Fail-safe -> [].
+    episodic: list[dict] = []
+    try:
+        from futures_fund.episodic import recall_for_context
+        episodic = recall_for_context(memory_dir, k_worst=3)[:8]
+    except Exception:  # noqa: BLE001 — descriptive recall is advisory; never break the cycle
+        episodic = []
     return {
         "cycle": cycle_no, "halted": False, "equity": health.equity,
         "drawdown_from_peak": health.drawdown_from_peak, "health_tier": health.tier,
@@ -255,10 +279,12 @@ def preflight_step(exchange, settings: Settings, state_dir, memory_dir,
         "audit": {"closed": report["closed"], "carried": report["carried"]},
         "market_context": market_context,
         "exposure": exposure,
-        "regime_state": _classify_regime_safe(state_dir, market_context, briefs, now, cycle_no),
+        "regime_state": regime_state,
         "scorecard": scorecard,
         "pacing": pacing,
         "improvement": improvement,
+        "lessons": lessons,
+        "episodic": episodic,
     }
 
 
@@ -465,6 +491,26 @@ def _proposal_to_stop_entry(p: dict, cycle_no: int):
         created_cycle=cycle_no, expires_cycle=cycle_no + 2)
 
 
+def _build_trigger_order(t: dict, cycle_no: int):
+    """Construct a PendingOrder from a Trader-emitted trigger dict. NORMALIZES the documented
+    `entry` field to the model's `trigger_level`: trader.md emits `entry` for both proposals and
+    triggers, so a trigger using the natural Trader output must arm, not be silently dropped.
+    `trigger_level` stays authoritative when both are present. Returns (PendingOrder, None) on
+    success, or (None, reason) when the dict can't form a valid trigger — the caller SURFACES the
+    reason rather than swallowing it (Rule 8: never a silent drop). Never raises."""
+    from futures_fund.pending_orders import PendingOrder
+    sym = t.get("symbol", "?") if isinstance(t, dict) else "?"
+    try:
+        fields = {**t}
+        if "trigger_level" not in fields and "entry" in fields:
+            fields["trigger_level"] = fields["entry"]
+        fields["created_cycle"] = cycle_no
+        fields["expires_cycle"] = int(t.get("expires_cycle", cycle_no + 3))
+        return PendingOrder.model_validate(fields), None
+    except Exception as e:  # noqa: BLE001 — never break the gate; report the cause instead
+        return None, f"{sym} trigger malformed ({type(e).__name__})"
+
+
 def _stamp_anchor_swing(po, swings_by_symbol: dict):
     """Stamp a breakout/breakdown stop_entry's ARM-TIME directional swing (swing_low for a short,
     swing_high for a long) so a later cycle can auto-cancel it once the swing crosses past it.
@@ -480,16 +526,24 @@ def _stamp_anchor_swing(po, swings_by_symbol: dict):
     return po.model_copy(update={"anchor_swing": sw[1] if po.direction == "short" else sw[0]})
 
 
-def _apply_counter_regime_confirmation(proposals: list[dict], regime_state, cycle_no: int):
+def _apply_counter_regime_confirmation(proposals: list[dict], regime_state, cycle_no: int, *,
+                                       market_neutral: bool = False):
     """SYMMETRIC entry-style gate (replaces the one-sided shorts drop-filter). Permission is never
     blocked; a COUNTER-regime fresh market proposal is rewritten into a confirmation stop_entry
     trigger instead of opening at market.
+
+    MARKET-NEUTRAL desks bypass this entirely: a short is the short SLEEVE of a hedged neutral
+    spread, not a directional knife, so BOTH sleeves open at market together (else a trending regime
+    strips one sleeve into triggers and opens the book one-sided, breaking neutrality by
+    construction). This frees the counter side; the gate's RR/liq/heat invariants stay.
 
     regime_state None (regime feature NOT wired — legacy/cold-start caller) -> pass-through at
     market, preserving the original contract (production ALWAYS passes a dict). A PROVIDED dict that
     is untrustworthy (no quorum / errored / unknown label — e.g. the classify-failed fallback) ->
     FAIL-CLOSED symmetric: BOTH directions require confirmation, so a degraded regime read can never
     open a naked market position either way. Returns (market_proposals, armed_triggers)."""
+    if market_neutral:
+        return list(proposals), []   # hedged spread: both sleeves open at market, never deferred
     if not isinstance(regime_state, dict):
         return list(proposals), []   # regime not wired -> preserve prior pass-through behavior
     regime = regime_state.get("regime")
@@ -705,6 +759,12 @@ def gate_execute_step(exchange, settings: Settings, state_dir, memory_dir,
     # has crossed PAST its level (the cy43 ETH inversion). Computed over completed bars (forming row
     # already dropped). A feed gap -> no entry -> fail-safe (no stamp, no auto-cancel).
     swings_by_symbol: dict = {}
+    # PRIOR-bar swing (the 20-bar extreme EXCLUDING the latest completed bar) — used to judge a
+    # FIRED stop_entry without the firing bar's own low/high folded in. A genuine fresh decisive
+    # break drops the CURRENT rolling swing past its level on the very bar it closes through, which
+    # would falsely trip the stale check; judging the FIRED set against the prior-bar swing cancels
+    # ONLY a true mid-bounce (structure already past the level BEFORE this bar). <2-bar/gap -> omit.
+    prior_swings_by_symbol: dict = {}
     for raw, uni in ctx.raw_to_unified.items():
         # A stop_entry/limit_entry must fire off the latest COMPLETED 4h bar — NOT the still-forming
         # candle the OHLCV feed returns as iloc[-1] (its transient close flips on every tick). Drop
@@ -724,6 +784,9 @@ def gate_execute_step(exchange, settings: Settings, state_dir, memory_dir,
         try:
             sh, sl = swing_levels(df)
             swings_by_symbol[raw] = (float(sh), float(sl))
+            if len(df) >= 2:   # prior-bar swing (exclude the firing bar) for the FIRED revalidation
+                psh, psl = swing_levels(df.iloc[:-1])
+                prior_swings_by_symbol[raw] = (float(psh), float(psl))
         except Exception:  # noqa: BLE001 — feed gap -> no swing entry -> fail-safe (Rule 4)
             pass
     fired, expired, remaining = check_pending_orders(state_dir, bars_by_symbol, cycle_no,
@@ -737,7 +800,15 @@ def gate_execute_step(exchange, settings: Settings, state_dir, memory_dir,
     # AND from remaining (not persisted) — so the team re-arms at the true level next cycle via the
     # flow (Rule 1, never a manual store edit). Only PRIOR-armed triggers are checked; this cycle's
     # new_triggers are placed against this swing and are fresh by construction. Symmetric+fail-safe.
-    stale_orders, _ = revalidate_triggers(fired + remaining, swings_by_symbol)
+    #
+    # SPLIT by fire-state so a FRESH decisive break is never killed by the geometry the firing bar
+    # itself created (the rolling swing folds in the firing bar's low/high): un-fired triggers are
+    # judged against the CURRENT swing (verbatim prior behavior), but FIRED triggers are judged
+    # against the PRIOR-bar swing — so a fired trigger is auto-canceled ONLY when the structure was
+    # already past its level BEFORE the firing bar (a true mid-bounce), never on the break itself.
+    stale_unfired, _ = revalidate_triggers(remaining, swings_by_symbol)
+    stale_fired, _ = revalidate_triggers(fired, prior_swings_by_symbol)
+    stale_orders = stale_unfired + stale_fired
     stale_ids = {o.id for o in stale_orders}
     stale_actions = []
     if stale_ids:
@@ -785,7 +856,9 @@ def gate_execute_step(exchange, settings: Settings, state_dir, memory_dir,
     stop_fired = [] if halted else [fired_to_proposal(o) for o in fired if o.kind == "stop_entry"]
     touch_fired = [] if halted else [fired_to_proposal(o) for o in fired if o.kind != "stop_entry"]
     to_confirm = ([] if halted else list(proposals)) + touch_fired
-    market_fresh, cr_armed = _apply_counter_regime_confirmation(to_confirm, regime_state, cycle_no)
+    market_fresh, cr_armed = _apply_counter_regime_confirmation(
+        to_confirm, regime_state, cycle_no,
+        market_neutral=getattr(settings, "market_neutral", False))
     proposals = market_fresh + stop_fired
     fired_props = stop_fired + touch_fired  # all fires, for telemetry (triggers_fired counts both)
 
@@ -795,21 +868,67 @@ def gate_execute_step(exchange, settings: Settings, state_dir, memory_dir,
     rationale_by_symbol: dict = {}
     prediction_by_symbol: dict = {}
     dropped = 0
+    drop_reasons: list[str] = []   # OBSERVABILITY: never drop a proposal SILENTLY — a malformed
+    #                                proposal (e.g. Trader omitted a required `atr`/`confidence`)
+    #                                would otherwise vanish into a bare count and flatten the book
+    #                                with no diagnosable reason. Surface the symbol + cause.
     for p in proposals:
+        _psym = p.get("symbol") if isinstance(p, dict) else getattr(p, "symbol", "?")
         try:
             ap = AgentProposal.model_validate(p)
             raw = ap.symbol if ap.symbol in ctx.specs_by_raw else unified_to_raw.get(ap.symbol)
             if raw is None:
                 dropped += 1
+                drop_reasons.append(f"{_psym}: unknown symbol (no spec/funding for it this cycle)")
                 continue
             funding = ctx.fundings[ctx.raw_to_unified[raw]].current_rate
             tp = to_trade_proposal(ap, funding).model_copy(update={"symbol": raw})
-        except Exception:  # noqa: BLE001 — malformed/invalid proposal: drop, keep the rest
+        except Exception as e:  # noqa: BLE001 — malformed/invalid proposal: drop, keep the rest
             dropped += 1
+            # name the offending FIELDS for a pydantic ValidationError (the field is on a later
+            # line, so flatten); otherwise the first line of the message.
+            fields = ""
+            if hasattr(e, "errors"):
+                try:
+                    fields = " missing/invalid: " + ", ".join(
+                        ".".join(str(x) for x in er.get("loc", ())) for er in e.errors())
+                except Exception:  # noqa: BLE001
+                    fields = ""
+            _emsg = (str(e).replace("\n", " ") if str(e) else type(e).__name__)[:120]
+            drop_reasons.append(f"{_psym}: {type(e).__name__}:{fields or ' ' + _emsg}")
             continue
         trade_props.append(tp)
         rationale_by_symbol[raw] = ap.rationale
         prediction_by_symbol[raw] = ap.falsifiable_prediction
+    # DOLLAR-NEUTRAL pre-size + balance (NON-protected; cycle.py stays byte-stable): stamp risk_mult
+    # on each new proposal so the gate sizes a ~equity/2-per-side balanced book at ~1x gross. Mirror
+    # the gate's own equity/caps (cycle.execute_proposals: portfolio_health + caps_for)
+    # so the notional target is exact, and net held long/short notional into the per-side targets.
+    # FAIL-SAFE: any error leaves trade_props untouched (gate still sizes them, just unbalanced).
+    neutral_summary = None
+    if trade_props:
+        try:
+            from futures_fund.baseline import simple_regime
+            from futures_fund.policy import caps_for
+            from futures_fund.portfolio import book_exposure
+            _nh = portfolio_health(account.balance, account.peak_equity, positions, ctx.prices)
+            _ncaps = caps_for(simple_regime(ctx.frames[ctx.settings.symbols[0]]), _nh)
+            _nexp = book_exposure(positions, ctx.prices, _nh.equity)
+            # PER-LEG caps: the gate sizes each proposal with ITS OWN symbol's regime caps, so build
+            # {raw_symbol: per_trade_risk_pct} the same way (else a leg whose regime differs from
+            # batch sizes off-target and blows the per-name cap — the BNB-concentration bug).
+            _ptr_by_sym = {}
+            for _tp in trade_props:
+                _uni = ctx.raw_to_unified.get(_tp.symbol)
+                if _uni in ctx.frames:
+                    _ptr_by_sym[_tp.symbol] = caps_for(simple_regime(ctx.frames[_uni]),
+                                                       _nh).per_trade_risk_pct
+            trade_props, neutral_summary = presize_and_balance(
+                trade_props, equity=_nh.equity, per_trade_risk_pct=_ncaps.per_trade_risk_pct,
+                held_long=_nexp.get("gross_long", 0.0), held_short=_nexp.get("gross_short", 0.0),
+                risk_pct_by_symbol=_ptr_by_sym)
+        except Exception:  # noqa: BLE001 — neutral pre-size is advisory sizing; never break the gate
+            neutral_summary = None
     # loop-aware attribution: the fast loop's opens come from the Scalper; the strategic loop's from
     # the CIO+Trader. (Per-desk attribution for strategic opens is added when the CIO output is
     # wired.)
@@ -821,6 +940,9 @@ def gate_execute_step(exchange, settings: Settings, state_dir, memory_dir,
                                prediction_by_symbol=prediction_by_symbol,
                                close_absent=not has_review, force_close=force_close, loop=loop)
     report["dropped"] = dropped
+    report["drop_reasons"] = drop_reasons          # per-proposal cause (never a silent count)
+    if drop_reasons:
+        report.setdefault("warnings", []).extend(f"DROPPED {r}" for r in drop_reasons)
     report["audit_dropped"] = len(audit_dropped)  # anti-hallucination drops (Pillar 4)
     if audit_dropped:
         report.setdefault("warnings", []).extend(
@@ -848,19 +970,18 @@ def gate_execute_step(exchange, settings: Settings, state_dir, memory_dir,
     new_triggers = [_stamp_anchor_swing(po, swings_by_symbol) for po in cr_armed]
     cr_keys = {(o.symbol, o.direction, o.kind) for o in cr_armed}
     armed_collisions = 0
+    trigger_drop_reasons: list[str] = []
     if not halted:
-        from futures_fund.pending_orders import PendingOrder
         for t in (triggers or []):
-            try:
-                fields = {**t, "created_cycle": cycle_no,
-                          "expires_cycle": int(t.get("expires_cycle", cycle_no + 3))}
-                po = _stamp_anchor_swing(PendingOrder.model_validate(fields), swings_by_symbol)
-                if (po.symbol, po.direction, po.kind) in cr_keys:
-                    armed_collisions += 1
-                    continue  # don't clobber the counter-regime safety trigger
-                new_triggers.append(po)
-            except Exception:  # noqa: BLE001 — drop a malformed trigger, keep the rest
-                pass
+            po, reason = _build_trigger_order(t, cycle_no)
+            if po is None:  # malformed -> SURFACE the cause, never a silent drop (Rule 8)
+                trigger_drop_reasons.append(reason or "trigger malformed")
+                continue
+            po = _stamp_anchor_swing(po, swings_by_symbol)
+            if (po.symbol, po.direction, po.kind) in cr_keys:
+                armed_collisions += 1
+                continue  # don't clobber the counter-regime safety trigger
+            new_triggers.append(po)
     # cancel is AUTHORITATIVE: a canceled key must not be re-armed this cycle, even by a cr-safety
     # conversion or a restated Trader trigger. Strip them so triggers_armed reflects the real store.
     if cancel_triggers:
@@ -878,6 +999,10 @@ def gate_execute_step(exchange, settings: Settings, state_dir, memory_dir,
     report["triggers_expired"] = len(expired)
     report["triggers_remaining"] = len(remaining)
     report["triggers_armed"] = len(new_triggers)
+    report["trigger_drop_reasons"] = trigger_drop_reasons  # malformed triggers, never silent
+    if trigger_drop_reasons:
+        report.setdefault("warnings", []).extend(
+            f"TRIGGER dropped {r}" for r in trigger_drop_reasons)
     report["triggers_canceled"] = n_canceled
     report["auto_canceled_stale"] = len(stale_ids)  # geometry-inverted triggers retired this cycle
     if stale_actions:                                # surface each so the team can re-arm (Rule 6)
@@ -906,7 +1031,17 @@ def gate_execute_step(exchange, settings: Settings, state_dir, memory_dir,
         final_positions = load_positions(state_dir)
         final_account = load_account(state_dir, settings.account_size_usdt)
         eq = total_equity(final_account.balance, final_positions, dict(ctx.prices))
-        report["exposure"] = book_exposure(final_positions, dict(ctx.prices), eq)
+        _final_exp = book_exposure(final_positions, dict(ctx.prices), eq)
+        report["exposure"] = _final_exp
+        # POST-GATE NEUTRALITY CHECK (non-protected, advisory): the upstream pre-sizer balances
+        # TARGET notionals, but gate rejections / asymmetric heat-clamping can leave the realized
+        # book mildly off net~=0. Surface |net|/gross vs the 0.30 canary so the operator/next cycle
+        # see drift; never un-opens (can't cleanly); the next cycle rebalances. + presize summary.
+        _tilt = float(_final_exp.get("tilt", 0.0) or 0.0)
+        report["neutral_check"] = {
+            "tilt": _tilt, "balanced": _tilt <= 0.30,
+            "presize": neutral_summary,
+        }
     except Exception:  # noqa: BLE001 — telemetry must never break the gate
         pass
     return report

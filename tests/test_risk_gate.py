@@ -45,9 +45,9 @@ def test_clean_trade_is_approved_and_leverage_is_output():
     d = evaluate(_inputs())
     assert d.verdict == "approve"
     assert d.sized_trade.leverage > 0
-    # risk ~= 3.0% of equity in low_vol_trend healthy (aggressive weekly envelope)
+    # risk ~= 1.5% of equity in low_vol_trend healthy (conservative dollar-neutral envelope)
     risk = d.sized_trade.qty * abs(100.0 - 95.0) / 10_000.0
-    assert risk == pytest.approx(0.030, abs=3e-3)
+    assert risk == pytest.approx(0.015, abs=3e-3)
 
 
 def test_stressed_portfolio_vetoes_new_entry():

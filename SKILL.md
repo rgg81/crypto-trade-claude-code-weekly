@@ -1,43 +1,39 @@
 ---
-name: futures-fund-weekly
-description: Orchestrate one cycle of the TEMPEST-WEEKLY aggressive dual-loop crypto-futures PAPER desk (5%/week). Use when a strategic (4h) or fast (15m) cycle is due, or asked to run the desk.
+name: futures-fund-neutral
+description: Orchestrate one cycle of the TEMPEST-NEUTRAL conservative dollar-neutral crypto-futures PAPER desk (~3%/month). Use when the single 4h strategic cycle is due, or asked to run the desk.
 ---
 
-# Operation TEMPEST-WEEKLY — Dual-Loop Trading Orchestrator
+# Operation TEMPEST-NEUTRAL — Single-Loop Dollar-Neutral Orchestrator
 
-You orchestrate an **aggressive, paper-only** Binance USD-M futures desk targeting **5% per WEEK**.
-Read `MISSION.md` now and hold it as your charter. You dispatch a team of **specialist hunter desks**
-+ a **CIO** over a deterministic Python gate (`futures_fund/`) that owns ALL math/risk/execution and
-**cannot be overridden**. Two loops share one account: a **fast 15m scalp loop** and a **strategic 4h
-trend/swing loop** (regime anchored on 4h).
+You orchestrate a **conservative, paper-only** Binance USD-M futures desk running a **DOLLAR-NEUTRAL**
+long/short book (~1x gross, gross long $ == gross short $) targeting **~3% per MONTH** net of cost.
+Read `MISSION.md` now and hold it as your charter. You dispatch a small team — **Momentum** (the edge
+driver: cross-sectional relative strength/weakness), **Carry** (tiebreaker), **News** → a **CIO** that
+builds the balanced book → **Trader** — over a deterministic Python gate (`futures_fund/`) that owns
+ALL math/risk/execution and **cannot be overridden**. There is **one loop: the strategic 4h cycle**
+(regime anchored on 4h). There is no fast loop and no scalper; exits are swept at the 4h cycle.
 
 **You ORCHESTRATE and VERIFY — the team decides, the gate sizes.** Never trade by gut, never hand-edit
-`state/`, never weaken a limit, never set `live: true`. Prereq: `uv sync` has been run.
+`state/`, never weaken a limit, never set `live: true`. Verify the book is actually dollar-neutral
+(|net|/gross small) and no leg is fee-negative. Prereq: `uv sync` has been run.
 
 ## Model dispatch — deciders are OPUS (non-negotiable)
 Dispatch every subagent with the model from `settings.model_for(<role>)` (config `agent_models`):
-- **OPUS** (decides money): `cio`, `trader`, `momentum`, `carry`, `news`, `sentiment`, `scalper`, `reflector`.
+- **OPUS** (decides money): `cio`, `trader`, `momentum`, `carry`, `news`, `sentiment`, `reflector`.
 - **Sonnet** (operational): `pace_officer` (it only narrates the deterministic pacing engine).
-- The **scalper is GATED**: dispatch it ONLY when the CIO returned `intraday_budget_frac > 0` AND a
-  non-empty `hot_list`. Otherwise the fast loop is exit-sweep only (zero-LLM, free).
 
 ## Concurrency — exactly one writer at a time
-Both loops share one book; correctness requires exactly one writer. The FAST loop holds the lock
-inside `scripts/fast_loop.py`. The STRATEGIC loop spans many steps, so acquire the lock at the START
-and release it at the END:
+The single 4h loop spans many steps, so acquire the lock at the START and release it at the END:
 - `uv run python scripts/runlock_cli.py acquire --owner strategic` → `ACQUIRED` (proceed) or
-  `LOCKED:` (a loop is running — stand down this fire).
+  `LOCKED:` (a cycle is running — stand down this fire).
 - ... run S1–S11 ...
 - `uv run python scripts/runlock_cli.py release` (always, even on error — a crash auto-reclaims after
   30 min).
 
-When BOTH loops are due on one poll, run **STRATEGIC first** (it sets regime/posture/budget), then
-**FAST**.
-
-## Which loop is due
-- Strategic: `uv run python scripts/due_check.py state --loop strategic`
-- Fast: `uv run python scripts/due_check.py state --loop fast`
-Each prints `DUE FRESH/RETRY <N>` (run that loop's playbook with cycle number `N`) or `SKIP:` (idle).
+## Which cycle is due
+- `uv run python scripts/run_loops.py` (acquires the lock, prints `strategic.due`), or
+- `uv run python scripts/due_check.py state --loop strategic`
+Prints `DUE FRESH/RETRY <N>` (run the playbook with cycle number `N`) or `SKIP:` (idle).
 
 ---
 
@@ -46,7 +42,12 @@ Each prints `DUE FRESH/RETRY <N>` (run that loop's playbook with cycle number `N
 **S1 — Scout + preflight.** `scout_cli.py --cycle N --top 30` → universe. `preflight.py --cycle N
 --symbols <UNIVERSE>` → audits closes (stop/TP/liq), folds in every held symbol, builds per-symbol
 briefs (indicators, structure, funding/OI/L-S, holding cards) + market context + the deterministic 4h
-`regime_state` → `context.json`. Let `PICKS` = the briefed symbols.
+`regime_state` → `context.json`. `context.json` ALSO carries two JUDGMENT-ONLY learning blocks the
+gate NEVER reads: (1) the **read-gated, honestly-tagged `lessons`** (Tier-2 statistical RULES) —
+validated `[RULE · …]` + proven-enough `[CANDIDATE — unproven (n=, conf=) · …]` (thin one-off cohorts
+withheld); and (2) **`episodic`** (Tier-1 descriptive) — the desk's WORST realised outcomes per
+setup fingerprint (regime × desk × direction), most-dangerous first, as an ANTI-PRESS tail brake.
+Every decision agent reads both. Let `PICKS` = the briefed symbols.
 **Stand-down:** if the scan is empty OR no desk surfaces a candidate, do NOT trade — still go to S7 with
 `proposals.json = {"proposals": [], "management": []}` (the **empty `management` list is mandatory** —
 an omitted/null `management` triggers close-by-absence and would flatten every holding) so holdings are
@@ -69,12 +70,17 @@ bullish AND bearish reads). Momentum/Carry = positioning. Each returns `{"report
 manufactures a confirmed risk-off). Re-read `context.json → regime_state` and inject the UPDATED value
 into the CIO + Trader.
 
-**S5 — CIO (opus).** Retrieve lessons (`retrieve_lessons_cli.py --cycle N --regime <q> --tags <...>`)
-and dispatch `cio` with every desk's candidates + regime + the pacing directive + scorecard + book
-exposure + lessons. It returns `CIOOutput` = `{allocations, intraday_budget_frac, hot_list,
-flat_verdicts}`. Save to `state/cycle/N/cio.json` (the fast loop reads `intraday_budget_frac` +
-`hot_list` from here). The CIO MAY run a one-sided directional book. Journal `flat_verdicts` (declined
-edge-aligned setups) via `flat_journal_cli.py --cycle N` for the Reflector's enabling-lesson loop.
+**S5 — CIO (opus).** Dispatch `cio` with every desk's candidates + regime + the pacing directive +
+scorecard + book exposure + the `lessons` already in `context.json` (S1 injected them — no separate
+retrieve step needed; `retrieve_lessons_cli.py --cycle N --regime <q> --tags <...>` remains available
+to manually inspect/re-pull the read-gated corpus). It returns `CIOOutput` = `{allocations,
+intraday_budget_frac, hot_list,
+flat_verdicts}`. Save to `state/cycle/N/cio.json` (`intraday_budget_frac` is 0 and `hot_list` empty —
+no scalper). The CIO builds a DOLLAR-NEUTRAL book (balanced long/short sleeves); it MUST NOT run a
+one-sided book. The deterministic pre-sizer (`neutral_book.py`) balances the allocations to equal
+dollars before the gate. Its `flat_verdicts` (declined
+edge-aligned setups, each ideally with `edge_aligned`/`favored_side`) are journaled **automatically by
+the gate step** (S7–10) for the enabling-lesson loop — no manual `flat_journal_cli` call.
 
 **S6 — Trader (opus).** For each CIO allocation, dispatch `trader` with the allocation
 (`risk_budget_frac` → its default `risk_mult`; `entry_style` market→`confirmation:false`,
@@ -89,35 +95,32 @@ health heat caps), gross-heat + CVaR consolidation, correlated-as-one cluster ca
 journals every decision (`loop:"strategic"` + originating `desk`) → `report.json`. Enforced regardless
 of agent output: HALT blocks new opens (closes still run); **-50% drawdown force-flattens** the book;
 malformed proposals are dropped; a kept HOLD is never re-stacked into a long+short. **You cannot
-override this gate.**
+override this gate.** On the strategic loop this step ALSO runs the **closed learning loop** (all
+fail-safe — a learning bug can never break trading): (1) **attribution** stamps desk × regime ×
+close_reason × `r_multiple` onto the just-closed journal rows; (2) the **flat-verdict bridge** journals
+the CIO's `flat_verdicts`; (3) the **deterministic reflect-runner** mines two-sided cohort candidates
+from the recent per-cohort window (count + cycle-recency bounded), CONFIRMS recurring ones, and
+promotes only when that cohort's **OWN cell** is statistically proven (**per-cell DSR≥0.95 + ≥5
+distinct cycles**) — demotes a validated rule its cohort just reversed, and runs an **asymmetric TTL
+sweep** (stale candidates retired; stale `enabling` 'press' rules demoted to re-prove; a working
+`restrictive` brake is never expired on silence). This grows the corpus every cycle without depending
+on the LLM Reflector remembering to write.
 
-**S11 — Reflect + learn.** `reflect_cli.py --cycle N` → reflection input (winners/losers + declined
+**S11 — Reflect + learn (QUALITATIVE layer).** The deterministic statistical layer ALREADY ran in
+S7–10 (cohort win/loss candidates, confirm/promote/demote). S11 adds what the machine is blind to: the
+*causal, narrative* lesson. `reflect_cli.py --cycle N` → reflection input (winners/losers + declined
 edge setups + missed opportunities). If there are closed trades OR missed opportunities, dispatch
-`reflector` (opus) → CANDIDATE lessons; then `record_lessons_cli.py --cycle N` (deterministic,
-idempotent). The Reflector MUST mint ≥1 `enabling` lesson when winners/missed-opps exist (keep the
-corpus two-sided). It may also confirm/demote/retire existing lessons:
+`reflector` (opus) → CANDIDATE lessons (`source:curated`, NOT read-gated — trust the LLM's reasoned
+lesson); then `record_lessons_cli.py --cycle N` (deterministic, idempotent). Do NOT just restate cohort
+counts (the miner has those) — mint the WHY. The Reflector MUST mint ≥1 `enabling` lesson when
+winners/missed-opps exist (keep the corpus two-sided). It may also confirm/demote/retire existing
+lessons:
 `promote_lesson_cli.py --id <lesson_id> --action confirm|demote|retire` (a lesson hitting the
 confirmation threshold becomes VALIDATED; demote stale/regime-mismatched rules aggressively). Run the
-heavier **meta-reflection at the WEEK boundary** (Monday 00:00 UTC) or when
+heavier **meta-reflection at the MONTH boundary** (1st 00:00 UTC) or when
 `improvement` flags near-zero deployment / one-sided corpus / decaying returns. Present `report.json`:
-actions, book, equity, and the **weekly pacing read** (on pace for 5%/week? deploying? improving?).
-
----
-
-## FAST playbook (15m) — exit sweep → (gated) Scalper → gate
-
-**F1 — Deterministic exit sweep (every fire, zero-LLM).** `uv run python scripts/fast_loop.py state
-memory` — acquires the lock, gates on the 15m candle, sweeps EVERY open position (scalps AND strategic
-swings) against the latest 15m bar, closes any that hit stop/TP/liq with correct fees/funding/
-slippage, runs the liquidation-proximity / -45% pre-flatten monitor tripwire, and writes
-`state/fast/cycle/N/report.json`.
-
-**F2 — Scalper (opus, GATED).** ONLY if the latest `cio.json` has `intraday_budget_frac > 0` AND a
-non-empty `hot_list`: dispatch `scalper` with the 15m briefs for the hot-list (≤6 names) + the
-strategic `regime_state` (READ it; never re-derive regime on 15m) + the intraday budget + open scalps
-→ `ScalperOutput` = `{proposals, management}` (gate-ready `AgentProposal`s — there is no separate
-Trader in the fast loop). Then run the gate on those scalp proposals with `loop:"fast"`. If there is
-no budget/hot-list, F1 was the entire fast cycle.
+actions, the balanced book + `neutral_check` (|net|/gross), equity, and the **monthly pacing read**
+(on pace for ~3%/month? balanced? cost-positive rebalances? improving?).
 
 ---
 

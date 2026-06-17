@@ -27,13 +27,18 @@ def reflection_payload(memory_dir) -> dict:
 
 def record_lesson(memory_dir, text: str, regime: str | None, tags: list[str],
                   importance: int, provenance: list[str], ts: datetime,
-                  polarity: str = "restrictive") -> str:
+                  polarity: str = "restrictive", n_support: int = 0,
+                  source: str = "curated", last_seen_cycle: int = -1) -> str:
     """Persist a Reflector-produced lesson as a CANDIDATE (structured store + human lessons.md).
     `polarity` (restrictive|enabling|process) keeps the corpus two-sided — the Reflector must be
-    able to record DO-rules, not only prohibitions."""
+    able to record DO-rules, not only prohibitions. `n_support` is the cohort size behind the
+    candidate; the retrieval read-gate withholds auto-MINED candidates from too thin a sample.
+    `source`='mined' marks a deterministic cohort summary (read-gated); 'curated' = hand/LLM.
+    `last_seen_cycle` stamps when the cohort produced it (drives TTL staleness expiry)."""
     lid = append_lesson(memory_dir, {
         "text": text, "regime": regime, "tags": tags, "importance": importance,
         "provenance": provenance, "state": "candidate", "polarity": polarity,
+        "n_support": n_support, "source": source, "last_seen_cycle": last_seen_cycle,
     }, ts=ts)
     md = Path(memory_dir) / "lessons" / "lessons.md"
     md.parent.mkdir(parents=True, exist_ok=True)
@@ -43,7 +48,8 @@ def record_lesson(memory_dir, text: str, regime: str | None, tags: list[str],
     return lid
 
 
-def record_lessons(memory_dir, lessons: list[dict], ts: datetime) -> list[str]:
+def record_lessons(memory_dir, lessons: list[dict], ts: datetime,
+                   source: str = "curated") -> list[str]:
     """Deterministically persist a Reflector's lesson LIST (e.g. state/cycle/N/lessons.json) to the
     corpus, so the reflect phase ALWAYS appends — never depending on the LLM Reflector agent to
     remember to call record_lesson (which it did in cycle 22 but not cycle 23). Idempotent by exact
@@ -60,6 +66,8 @@ def record_lessons(memory_dir, lessons: list[dict], ts: datetime) -> list[str]:
             memory_dir, text=text, regime=lesson.get("regime"), tags=list(lesson.get("tags") or []),
             importance=int(lesson.get("importance", 5)),
             provenance=list(lesson.get("provenance") or []), ts=ts,
-            polarity=str(lesson.get("polarity", "restrictive"))))
+            polarity=str(lesson.get("polarity", "restrictive")),
+            n_support=int(lesson.get("n_support", 0)),
+            source=str(lesson.get("source", source))))
         existing.add(text)
     return ids

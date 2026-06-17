@@ -72,11 +72,8 @@ def _default_loops() -> dict[str, LoopSettings]:
 def _default_agent_models() -> dict[str, str]:
     """Authoritative per-AGENT model assignment, resolved at dispatch time (overrides the loop's
     coarse deep/quick tiers). Rule: every agent that DECIDES money runs on OPUS; only genuinely
-    operational agents (that narrate deterministic logic) run cheaper.
-
-    Note: `scalper` is OPUS but its dispatch is GATED by the runner — it is only invoked when the
-    CIO granted intraday budget AND a non-empty hot-list, so Opus does not fire on every quiet 15m
-    candle (the deterministic exit-sweep still runs every fire, for free)."""
+    operational agents (that narrate deterministic logic) run cheaper. The single 4h strategic loop
+    dispatches momentum/carry/news -> CIO -> Trader; the Scalper is RETIRED (no fast loop)."""
     return {
         # OPUS — agents that decide money (alpha theses, allocation, trade geometry, learning)
         "cio": "opus",
@@ -85,7 +82,6 @@ def _default_agent_models() -> dict[str, str]:
         "carry": "opus",
         "news": "opus",
         "sentiment": "opus",
-        "scalper": "opus",          # dispatch GATED (see docstring)
         "reflector": "opus",
         # SONNET — operational (narrates deterministic pacing; the press/anti-martingale logic is
         # computed in futures_fund.pacing, not by the LLM)
@@ -100,11 +96,14 @@ class Settings(BaseModel):
     symbols: list[str] = Field(default_factory=lambda: ["BTC/USDT:USDT", "ETH/USDT:USDT"])
     deep_model: str = "opus"
     quick_model: str = "haiku"
-    verdict_horizon_weeks: int = 8
-    target_weekly: float = 0.05         # the 5%/WEEK mandate driving the pacing engine
-    max_drawdown_tolerance: float = 0.50  # the -50% hard force-flatten breaker level
+    verdict_horizon_months: int = 2
+    target_monthly: float = 0.03        # the ~3%/MONTH mandate driving the pacing engine
+    max_drawdown_tolerance: float = 0.15  # the -15% hard force-flatten breaker level
     loops: dict[str, LoopSettings] = Field(default_factory=_default_loops)
     agent_models: dict[str, str] = Field(default_factory=_default_agent_models)
+    # DOLLAR-NEUTRAL desk: both sleeves of the hedged spread open at market (counter-regime
+    # confirmation is a directional-desk feature; see _apply_counter_regime_confirmation).
+    market_neutral: bool = True
     live: bool = False  # PAPER-ONLY desk: MUST stay false (live needs a 'graduated' verdict too)
     exchange: ExchangeSettings = Field(default_factory=ExchangeSettings)
     data: DataSettings = Field(default_factory=DataSettings)

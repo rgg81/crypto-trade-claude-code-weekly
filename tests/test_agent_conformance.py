@@ -9,7 +9,6 @@ from futures_fund.contracts import (
     AnalystReport,
     CIOOutput,
     ResearchPlan,
-    ScalperOutput,
     WatcherOutput,
 )
 from futures_fund.lessons import Lesson
@@ -63,13 +62,6 @@ def test_cio_example_conforms():
     out = CIOOutput.model_validate(_load("cio.json"))
     assert out.allocations and out.allocations[0].risk_budget_frac <= 1.0
     assert 0.0 <= out.intraday_budget_frac <= 1.0
-
-
-def test_scalper_example_conforms():
-    out = ScalperOutput.model_validate(_load("scalper.json"))
-    # scalper emits gate-ready AgentProposals directly + management of open scalps
-    assert all(p.direction in {"long", "short"} for p in out.proposals)
-    assert out.management and out.management[0]["action"] in {"hold", "close", "reduce"}
 
 
 def test_reflector_example_lessons_conform():

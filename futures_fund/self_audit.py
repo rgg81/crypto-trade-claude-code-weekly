@@ -18,18 +18,18 @@ def _checks() -> list[tuple[str, bool, str]]:
 
     # 1. ANTI-MARTINGALE: pacing must NEVER press while in drawdown (it would double into losses).
     from futures_fund.pacing import CAUTION_DD, compute_pacing
-    dd_press = compute_pacing(wtd_return=-0.04, days_elapsed=3, days_in_week=7,
+    dd_press = compute_pacing(mtd_return=-0.04, days_elapsed=10, days_in_month=30,
                               drawdown=CAUTION_DD + 0.01, open_heat=0.0).mode
     add("pacing.anti_martingale", dd_press != "press",
         f"in-drawdown mode={dd_press} (must NOT be press)")
 
     # 2. Pacing DOES press when genuinely behind + healthy + under-deployed (deployment works).
-    behind = compute_pacing(wtd_return=0.0, days_elapsed=3, days_in_week=7,
+    behind = compute_pacing(mtd_return=0.0, days_elapsed=10, days_in_month=30,
                             drawdown=0.0, open_heat=0.0).mode
     add("pacing.presses_when_behind", behind == "press", f"behind+healthy mode={behind}")
 
-    # 3. Pacing throttles once the weekly target is hit.
-    hit = compute_pacing(wtd_return=0.05, days_elapsed=2, days_in_week=7,
+    # 3. Pacing throttles once the monthly target is hit.
+    hit = compute_pacing(mtd_return=0.03, days_elapsed=10, days_in_month=30,
                          drawdown=0.0, open_heat=0.0).mode
     add("pacing.throttles_at_target", hit == "throttle", f"target-hit mode={hit}")
 
@@ -55,13 +55,14 @@ def _checks() -> list[tuple[str, bool, str]]:
                         is_trigger=False)[0]
     add("audit.long_short_symmetric", longv == shortv, f"long={longv} short={shortv}")
 
-    # 8. ADAPT: the playbook routes range->mean-reversion and trend->trend-follow.
+    # 8. ADAPT: the neutral playbook routes range->mean-reversion/carry and trend->momentum
+    # dispersion (long relative-strength / short relative-weakness).
     from futures_fund.playbook import is_range, playbook_for
     _rng_pb = playbook_for("low_vol_range")["strategies"]
-    rng = any("mean-reversion" in s or "fade" in s for s in _rng_pb)
-    trd = any("trend" in s for s in playbook_for("high_vol_trend")["strategies"])
+    rng = any("mean-reversion" in s or "fade" in s or "carry" in s for s in _rng_pb)
+    trd = any("momentum" in s for s in playbook_for("high_vol_trend")["strategies"])
     add("playbook.regime_routing", rng and trd and is_range("low_vol_range"),
-        f"range_mr={rng} trend_tf={trd}")
+        f"range_mr={rng} trend_momentum={trd}")
 
     return out
 

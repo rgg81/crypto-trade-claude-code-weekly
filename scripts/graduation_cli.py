@@ -10,7 +10,7 @@ from futures_fund.scorecard import build_scorecard
 
 
 def main() -> None:
-    sc = build_scorecard("state", "memory", weekly_target=0.05)
+    sc = build_scorecard("state", "memory", monthly_target=0.03)
     print(json.dumps(sc["graduation"], indent=2, default=str))
 
 

@@ -77,12 +77,12 @@ def _is_halted_raw(state_dir) -> bool:
         return False
 
 
-# Strategic-loop-equivalent cycles per week (1h cadence ≈ 168/week); the trailing-pace warning
-# prorates the 5%/week target over the trailing window relative to this. Heuristic guidance only.
-_CYCLES_PER_WEEK = 168
+# Strategic-loop cycles per month (4h cadence = 6/day ≈ 180/month); the trailing-pace warning
+# prorates the 3%/month target over the trailing window relative to this. Heuristic guidance only.
+_CYCLES_PER_MONTH = 180
 
 
-def build_scorecard(state_dir, memory_dir, weekly_target: float = 0.05,
+def build_scorecard(state_dir, memory_dir, monthly_target: float = 0.03,
                     min_cycles: int = 20, horizon_cycles: int = 120) -> dict:
     """The desk's statistical self-portrait — injected into EVERY agent prompt so the team
     reasons WITH its measured track record (equity, return vs target, drawdown, risk-adjusted
@@ -93,7 +93,7 @@ def build_scorecard(state_dir, memory_dir, weekly_target: float = 0.05,
     n_cycles = len(eq)
 
     if not eq:
-        return {"equity": None, "weekly_target": weekly_target, "n_cycles": 0, "n_closed": 0,
+        return {"equity": None, "monthly_target": monthly_target, "n_cycles": 0, "n_closed": 0,
                 "sharpe": 0.0, "sortino": 0.0, "max_drawdown": 0.0, "hit_rate": 0.0,
                 "profit_factor": 0.0, "period_return": 0.0, "agent_hit_rates": {},
                 "graduation": graduation_verdict(
@@ -125,9 +125,9 @@ def build_scorecard(state_dir, memory_dir, weekly_target: float = 0.05,
     # context is a one-way ratchet that talks the desk out of every clean trade — the root cause of
     # the desk standing down to cash for cycles on end. See tests/test_scorecard.py.
     warnings: list[str] = []
-    # --- BRAKE: real drawdown hard-brakes, but the desk is DRAWDOWN-TOLERANT (~50%), so the brake
-    # engages at -20% (the policy step-down band), not -5%. ---
-    if mdd >= 0.20:
+    # --- BRAKE: a ~1x dollar-neutral book that draws down has a correlation/beta breakdown, so the
+    # brake engages early at -10% (the policy 'stressed' band), well inside the -15% flatten. ---
+    if mdd >= 0.10:
         warnings.append(f"in drawdown: {mdd:.0%} from peak — bias risk-off")
     # --- BRAKE: unproven edge sizes down (unchanged) ---
     if n_cycles >= 11 and dsr < 0.95:  # DSR only computable at >=10 returns
@@ -137,11 +137,12 @@ def build_scorecard(state_dir, memory_dir, weekly_target: float = 0.05,
     # hit-rate). Demands quality WITHOUT mandating passivity. ---
     window = min(len(rets), 30)
     trailing = sum(rets[-window:]) if window else 0.0
-    if n_cycles >= 6 and trailing < weekly_target * (window / _CYCLES_PER_WEEK):
+    if n_cycles >= 6 and trailing < monthly_target * (window / _CYCLES_PER_MONTH):
         warnings.append(
-            f"below the {weekly_target:.0%}/week pace — require a clean, proven-edge setup before "
-            "sizing up and do NOT chase or force low-quality trades; but a qualifying setup that "
-            "clears RR>=2 and the heat cap is NOT forcing — do not stand flat on it")
+            f"below the {monthly_target:.0%}/month pace — require a clean proven-edge pair "
+            "before sizing up and do NOT chase or force low-quality trades; but a qualifying "
+            "cost-positive rebalance that clears RR>=2 and the heat cap is NOT forcing — do not "
+            "stand flat on it")
     # --- ACCELERATOR (counter-signal): opportunity cost of idle cash. Fires ONLY in a tradeable
     # state — healthy, not halted, FLAT, zero opens over the last 2 cycles, AND the screen still
     # surfacing candidates — and self-silences the moment the desk is deployed, in drawdown,
@@ -149,20 +150,20 @@ def build_scorecard(state_dir, memory_dir, weekly_target: float = 0.05,
     # ---
     eq_peak = max(eq)
     cur_dd = (eq_peak - eq[-1]) / eq_peak if eq_peak > 0 else 0.0
-    if (n_cycles >= 6 and cur_dd < 0.20 and not _is_halted_raw(state_dir)
+    if (n_cycles >= 6 and cur_dd < 0.10 and not _is_halted_raw(state_dir)
             and not _has_open_positions(state_dir)
             and _recent_open_count(state_dir, k=2) == 0
             and _latest_screen_has_candidates(state_dir)):
         warnings.append(
             "under-deployed: FLAT with zero new opens across the last 2 cycles while the screen "
             f"keeps surfacing candidates — idle cash has opportunity cost vs the "
-            f"{weekly_target:.0%}"
-            "/week target. Standing flat is itself a position with negative carry; do NOT stand "
-            "flat on a clean, edge-aligned setup that clears the gate (RR>=2 + heat). Taking it "
-            "is NOT forcing.")
+            f"{monthly_target:.0%}"
+            "/month target. Standing flat is itself a position with negative carry; do NOT stand "
+            "flat on a clean, balanced, cost-positive pair that clears the gate (RR>=2 + heat). "
+            "Taking it is NOT forcing.")
 
     return {
-        "equity": eq[-1], "weekly_target": weekly_target, "n_cycles": n_cycles,
+        "equity": eq[-1], "monthly_target": monthly_target, "n_cycles": n_cycles,
         "n_closed": len(closed), "period_return": period_return,
         "sharpe": shp, "sortino": sortino(rets), "max_drawdown": mdd,
         "hit_rate": hr, "profit_factor": profit_factor(closed),

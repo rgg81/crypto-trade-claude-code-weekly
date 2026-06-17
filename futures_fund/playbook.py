@@ -5,29 +5,34 @@ and strategies, so the CIO/Trader switch playbook WITH the tape instead of forci
 everywhere. Pure/advisory: it shapes which DESK leads and which setups they hunt; the deterministic
 gate still owns all risk/sizing.
 
-DIRECTIONAL doctrine (TEMPEST-WEEKLY): this is an aggressive, NOT market-neutral desk — it runs a
-one-sided book when a regime pays. All-weather means PROFIT IN ALL CONDITIONS by routing the right
-desk to the right tape: Momentum leads trends, Carry + Scalper lead ranges, Scalper leads madness.
+DOLLAR-NEUTRAL doctrine (TEMPEST-NEUTRAL): the book is ALWAYS balanced long/short (gross long$ ==
+gross short$, ~1x). "All-weather" here means pairing the right EDGE on both sleeves: the dominant
+neutral edge is cross-sectional MOMENTUM DISPERSION (long relative-strength / short relative-
+weakness) with funding CARRY as a secondary tiebreaker — NEVER short a hot high-funding name just to
+harvest carry (Phase-0 lesson: that sleeve net-loses). The desk routes which edge leads per regime
+but NEVER runs one-sided; the deterministic gate owns all risk/sizing.
 """
 from __future__ import annotations
 
-# quadrant -> (in-season desks/strategies, one-line guidance)
+# quadrant -> (in-season neutral edges/strategies, one-line guidance). ALL balanced long/short.
 _PLAYBOOK: dict[str, tuple[list[str], str]] = {
     "low_vol_trend": (
-        ["momentum:trend-follow", "momentum:breakout", "squeeze-long/flush-short", "carry-overlay"],
-        "Clean trend: MOMENTUM desk LEADS — ride with-trend pullback/breakout entries full size; "
-        "carry as a steady overlay."),
+        ["rv-momentum:long-strong/short-weak", "carry-tiebreaker", "relative-value"],
+        "Clean trend: MOMENTUM DISPERSION leads — long the relative-strength names, short the "
+        "relative-weakness names to equal $; carry only as a tiebreaker, never short a pumping "
+        "high-funding name."),
     "high_vol_trend": (
-        ["momentum:trend-follow", "breakout-trigger", "scalper-swings"],
-        "Strong volatile trend: Momentum continuation WITH-regime; Scalper works the swings; gate "
-        "only the counter-trend knife."),
+        ["rv-momentum:long-strong/short-weak", "relative-value", "reduce-size"],
+        "Strong volatile trend: momentum dispersion WITH tighter stops and smaller per-leg size; "
+        "keep the book balanced — RV blow-outs lose BOTH sleeves."),
     "low_vol_range": (
-        ["carry-harvest", "mean-reversion:fade-edges", "scalper", "relative-value"],
-        "Quiet range: CARRY + SCALPER LEAD — fade band edges (RR>=2) and harvest funding; Momentum "
-        "stands down."),
+        ["carry-neutral:long-neg/short-pos-funding", "mean-reversion:fade-edges", "relative-value"],
+        "Quiet range: CARRY-NEUTRAL + RELATIVE-VALUE lead — pair neg-funding longs vs pos-funding "
+        "shorts (collect both legs) and fade band-edge spreads to equal $."),
     "high_vol_range": (
-        ["scalper-small", "mean-reversion-small", "relative-value", "reduce-size"],
-        "Choppy/madness: SCALPER only — smallest size, fastest exits; Momentum/Carry stand down."),
+        ["relative-value", "mean-reversion-small", "reduce-size"],
+        "Choppy/madness: smallest balanced relative-value only — reduce gross, widen the no-trade "
+        "band; do not chase dispersion into a whipsaw."),
     "transition": (
         ["confirmation-only", "reduce-size"],
         "Regime unclear: confirmation-gated entries only, reduced size; no directional knife."),

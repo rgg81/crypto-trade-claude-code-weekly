@@ -1,14 +1,17 @@
-# CLAUDE.md — Operation TEMPEST-WEEKLY (autonomous AGGRESSIVE futures PAPER desk)
+# CLAUDE.md — Operation TEMPEST-NEUTRAL (autonomous CONSERVATIVE dollar-neutral futures PAPER desk)
 
 This repo is a Claude-native multi-agent trading desk: an orchestrator (Claude running `SKILL.md`)
-dispatches a team of **specialist hunter desks** (Momentum/Breakout/Squeeze, Scalper, Funding/Basis
-carry, Catalyst/News) → a **CIO/Allocator** → Trader, plus an **Aggression/Pace Officer**, over a
-deterministic Python gate (`futures_fund/`) that owns all math/risk/execution. It runs PAPER on real
-Binance USD-M mainnet data, on TWO loops — a fast 15m scalp loop and a strategic 4h trend/swing loop
-(regime anchored on 4h) — driven by a single serialized poll under a single-flight run lock.
+dispatches a small team — **Momentum** (cross-sectional relative strength/weakness, the edge driver),
+**Funding/Basis carry** (a tiebreaker), **Catalyst/News** (events + a market-wide risk-off flag) → a
+**CIO/Allocator** that builds a balanced book → **Trader**, plus a **Pace Officer** and **Reflector**,
+over a deterministic Python gate (`futures_fund/`) that owns all math/risk/execution. It runs PAPER on
+real Binance USD-M mainnet data, on a **single 4h loop**, under a single-flight run lock.
 
-**Mandate: 5% per WEEK, net of all costs. Drawdown-tolerant (~50%). Bold, directional, NOT
-market-neutral.** PAPER ONLY — `live` stays false, forever.
+**Mandate: ~3% per MONTH, net of all costs (a CEILING the edge must clear, not a quota). DOLLAR-NEUTRAL
+— gross long $ == gross short $ at ~1x gross (no leverage). Conservative: −15% force-flatten.** The
+edge is cross-sectional **momentum dispersion** (long relative-strength / short relative-weakness),
+with funding **carry** as a secondary tiebreaker — **never short a hot high-funding name to harvest
+carry** (Phase-0 lesson: that sleeve net-loses). PAPER ONLY — `live` stays false, forever.
 
 ---
 
@@ -19,14 +22,18 @@ These override convenience, speed, and token cost. When in doubt, follow them li
 ### 1. The deterministic gate is ABSOLUTE.
 `risk_gate`, `sizing`, `liquidation`, `consolidation`, `executor`, `exits`, `policy`, `cycle` are
 PROTECTED. The team proposes in price terms; the gate owns sizing, leverage (an OUTPUT, ≤ the regime
-cap), liq-distance (≥2.5x), RR (≥2), heat, and the circuit breakers (-20% step-down, -50% force-
-flatten). No agent and no orchestrator can override it. A code fix here may NEVER weaken a limit.
+cap, ~1x in practice), liq-distance (≥2.5x), RR (≥2), heat, and the circuit breakers (−5% step-down,
+−10% reduce-only, −15% force-flatten). No agent and no orchestrator can override it. A code fix here
+may NEVER weaken a limit. The dollar-neutral pre-sizer (`neutral_book.py`) and rebalance gate
+(`rebalance_cost.py`) are NON-protected and only ever SHRINK risk / advise — they never weaken the gate.
 
-### 2. Bold, not reckless — the target is a goal, not a quota.
-ACTIVELY pursue 5%/week: the CIO + Pace Officer deploy hard, press when behind pace, run a one-sided
-directional book when a regime pays. BUT: **never press while in drawdown** (anti-martingale — the
-breakers own the loss path; pacing only spends UNUSED budget), and never chase a thin setup that
-fails the gate. Under-performing the week is acceptable; martingaling into the -50% flatten is not.
+### 2. Balanced and cost-aware — the target is a ceiling, not a quota.
+Run a DOLLAR-NEUTRAL book: equal gross long and short, momentum-dispersion-led, carry as a tiebreaker.
+**Never tilt one-sided to chase pace** (pressing = a balanced-but-fuller book, never a naked sleeve), and
+**never admit a fee-negative leg** (expected edge must beat the 0.14% round-trip + adverse funding). A
+cost-aware rebalance HOLD overrides a pacing PRESS. **Never press while in drawdown** (anti-martingale —
+the breakers own the loss path). Under-performing ~3%/month is acceptable; churning a thin book into
+fees or martingaling into the −15% flatten is not.
 
 ### 3. Fix every issue in the TEAM SKILL — never work around it by hand.
 Any bug, calc error, asymmetry, or missing capability gets fixed by improving the skill — code, agent
@@ -39,15 +46,17 @@ The orchestrator must NEVER manually edit `state/` (`positions.json`, `account.j
 
 ### 5. Calc-vigilance is always on.
 Independently re-derive equity mark-to-market and verify every trade's size / stop / PnL / funding
-sign / RR before trusting gate output. Scrutinize ANY financial math for errors and surface them.
+sign / RR before trusting gate output. Verify the book is actually dollar-neutral (|net|/gross small)
+and that funding is signed as a CREDIT when collected. Scrutinize ANY financial math and surface errors.
 
 ### 6. Edge net of costs, every time.
-At 10x and high frequency, fees + funding + slippage compound fast. Every edge — especially a scalp —
-must clear its round-trip cost AFTER the gate nets it. A cost-negative desk/loop gets cut, not fed.
+A dollar-neutral book has no market beta to lean on — at net-neutral the book grinds to ZERO minus
+turnover if the edge is weak. Every leg must clear its round-trip cost (fees + funding + slippage)
+AFTER the gate nets it; rebalance only when the realignment edge beats the turnover cost.
 
 ### 7. One writer at a time.
-Both loops mutate one shared book. Always run under the single-flight lock (`state/.run.lock`); run
-the STRATEGIC loop before the FAST loop when both are due. Never run a loop outside the lock.
+The single 4h loop mutates one shared book. Always run under the single-flight lock (`state/.run.lock`);
+never run a cycle outside the lock.
 
 ### 8. Be proactively alert; report flags without being asked, then turn them into skill improvements.
 
@@ -55,4 +64,4 @@ the STRATEGIC loop before the FAST loop when both are due. Never run a loop outs
 
 Protected modules (NEVER edit; a fix may not weaken a limit/breaker/safety path): `risk_gate`,
 `executor`, `exits`, `consolidation`, `policy`, `liquidation`, `sizing`, `cycle`. The FULL test
-suite (`uv run pytest`) must pass before any commit. PAPER ONLY: `live` must stay false.
+suite (`uv run pytest`) and `ruff check .` must pass before any commit. PAPER ONLY: `live` must stay false.

@@ -37,7 +37,39 @@ def read_flat_decisions(memory_dir) -> list[dict]:
     p = _store(memory_dir)
     if not p.exists():
         return []
-    return [json.loads(line) for line in p.read_text().splitlines() if line.strip()]
+    out: list[dict] = []
+    for line in p.read_text().splitlines():
+        if not line.strip():
+            continue
+        try:                                  # one corrupt line must not crash the learning pass
+            out.append(json.loads(line))
+        except (json.JSONDecodeError, ValueError):
+            continue
+    return out
+
+
+def record_cycle_flat_verdicts(memory_dir, cycle_no: int, verdicts: list[dict],
+                               now: datetime, *, regime: str | None = None,
+                               marks: dict[str, float] | None = None) -> list[str]:
+    """Bridge the CIO's `flat_verdicts` (declined edge-aligned setups, written inside cio.json) into
+    the flat-decision journal so `evaluate_pending_flats` can later score whether standing aside
+    COST the desk — the data source for ENABLING 'DO take it' lessons. IDEMPOTENT per (cycle,
+    symbol) so a cycle RETRY never double-journals. Fills regime/mark from the cycle context when
+    the CIO omitted them. Returns the ids actually appended."""
+    marks = marks or {}
+    seen = {(r.get("cycle"), r.get("symbol")) for r in read_flat_decisions(memory_dir)}
+    ids: list[str] = []
+    for v in verdicts or []:
+        sym = v.get("symbol")
+        if not sym or (cycle_no, sym) in seen:
+            continue
+        fields = {**v, "cycle": cycle_no}
+        fields.setdefault("regime", regime)
+        if fields.get("mark") is None and sym in marks:
+            fields["mark"] = marks[sym]
+        ids.append(append_flat_decision(memory_dir, fields, ts=now))
+        seen.add((cycle_no, sym))
+    return ids
 
 
 def _write_all(memory_dir, rows: list[dict]) -> None:

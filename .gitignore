@@ -19,3 +19,6 @@ venv/
 
 # Claude Code local session state
 .claude/
+
+# throwaway analysis scripts (Phase-0 feasibility, etc.)
+scratch/

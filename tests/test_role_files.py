@@ -2,10 +2,10 @@ from pathlib import Path
 
 import pytest
 
-# Active roster for the dual-loop directional desk: specialist hunter desks + CIO + Pace Officer +
-# Trader + Reflector, over the deterministic-gate docs. Retired debate agents live in
-# agents/archive/.
-ROLES = ["momentum", "carry", "news", "sentiment", "scalper", "cio", "pace_officer",
+# Active roster for the single-4h-loop dollar-neutral desk: momentum/carry/news desks + CIO + Pace
+# Officer + Trader + Reflector, over the deterministic-gate docs. Retired agents (incl. the Scalper,
+# fast-loop-only) live in agents/archive/.
+ROLES = ["momentum", "carry", "news", "sentiment", "cio", "pace_officer",
          "trader", "risk_manager", "portfolio_manager", "reflector"]
 
 

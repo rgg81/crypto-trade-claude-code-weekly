@@ -1,14 +1,14 @@
-"""Regime-routed playbook (Pillar 2 ADAPT): each quadrant maps to its in-season strategies so the
-desk switches playbook with the tape (trend->trend-follow, range->mean-reversion, madness->small/RV,
-transition->confirm)."""
+"""Regime-routed neutral playbook (Pillar 2 ADAPT): each quadrant maps to its in-season balanced
+long/short edges so the desk switches with the tape (trend->momentum dispersion, range->mean-
+reversion/carry, madness->small/RV, transition->confirm)."""
 from futures_fund.playbook import _PLAYBOOK, is_range, playbook_for
 
 
-def test_trend_quadrants_route_to_trend_follow():
+def test_trend_quadrants_route_to_momentum_dispersion():
     for q in ("low_vol_trend", "high_vol_trend"):
         pb = playbook_for(q)
         assert pb["quadrant"] == q
-        assert any("trend" in s for s in pb["strategies"])
+        assert any("momentum" in s for s in pb["strategies"])
         assert not is_range(q)
 
 

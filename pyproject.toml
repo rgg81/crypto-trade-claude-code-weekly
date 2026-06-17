@@ -26,6 +26,7 @@ addopts = "-q"
 [tool.ruff]
 line-length = 100
 target-version = "py311"
+extend-exclude = ["scratch"]   # throwaway/uncommitted analysis scripts (e.g. Phase-0 feasibility)
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B"]

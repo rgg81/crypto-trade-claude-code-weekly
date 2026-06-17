@@ -34,6 +34,23 @@ def main() -> None:
     if args.symbols is not None:
         syms = [s.strip() for s in args.symbols.split(",") if s.strip()]
         settings = settings.model_copy(update={"symbols": syms})
+    else:
+        # ROBUSTNESS: when --symbols is omitted, fold in the universe the desks actually analyzed —
+        # the unified symbols from THIS cycle's context.json briefs. Without this the gate would
+        # fetch only the config-default symbols and DROP every proposal on a scout-picked alt
+        # (their specs/funding were never loaded) — silently flattening the whole book. Fail-safe:
+        # on any error we leave settings unchanged (prior behavior).
+        try:
+            _ctx0 = load_output("state", args.cycle, "context")
+            _uni = [b.get("symbol") for b in (_ctx0.get("briefs") or [])
+                    if b.get("symbol") and not b.get("regime_panel_only")]
+            if _uni:
+                settings = settings.model_copy(update={"symbols": sorted(set(_uni))})
+                print(f"INFO: --symbols omitted; folded {len(set(_uni))} symbols from "
+                      f"cycle {args.cycle} context briefs into the gate universe.", file=sys.stderr)
+        except FileNotFoundError:
+            print("WARNING: --symbols omitted and context.json missing — gate runs on config "
+                  "default symbols; proposals on unfetched symbols will drop.", file=sys.stderr)
     ex = FuturesExchange.from_settings(settings)
     payload = load_output("state", args.cycle, "proposals")
     # The agent path ALWAYS carries a holdings review (possibly empty). A missing/null management
@@ -99,6 +116,62 @@ def main() -> None:
                                management=management, regime_state=regime_state, triggers=triggers,
                                cancel_triggers=cancel_triggers, ground_truth=ground_truth,
                                loop=args.loop)
+    # ATTRIBUTION (Phase 0 of the learning loop): stamp desk x regime x close_reason x r_multiple
+    # onto the journal so the learner can later slice experience by 'which desk lost, in which
+    # regime, and why'. The gate's own close-patch omits these; we re-patch here rather than edit
+    # the PROTECTED cycle.py. FAIL-SAFE: learning is advisory — a bug here must never break trading.
+    try:
+        from futures_fund.attribution import stamp_cycle_attribution
+        desk_by_symbol: dict = {}
+        try:
+            _cio = load_output("state", args.cycle, "cio")
+            desk_by_symbol = {a.get("symbol"): a.get("desk")
+                              for a in (_cio.get("allocations") or []) if a.get("symbol")}
+        except FileNotFoundError:
+            pass
+        stamp_cycle_attribution("memory", args.cycle, report,
+                                (regime_state or {}).get("regime"), desk_by_symbol, now)
+    except Exception as _e:  # noqa: BLE001 — never let the learning layer break the trading cycle
+        print(f"WARNING: attribution stamping failed (non-fatal): {_e!r}", file=sys.stderr)
+    # LEARNING LOOP (Phase 1): on the STRATEGIC loop only (the fast loop scalps within strategic
+    # posture and does not re-reflect), bridge the CIO's declined-setup verdicts into the flat
+    # journal, then run ONE reflect pass so every close updates the two-sided, DSR-gated lesson
+    # corpus the next cycle's agents read. FAIL-SAFE — advisory; a bug here never breaks trading.
+    if args.loop == "strategic":
+        _reg = (regime_state or {}).get("regime")
+        try:
+            from futures_fund.flat_journal import record_cycle_flat_verdicts
+            _cioj = {}
+            try:
+                _cioj = load_output("state", args.cycle, "cio")
+            except FileNotFoundError:
+                # cio.json should ALWAYS exist on a strategic cycle — warn LOUDLY (don't silently
+                # pass) so a skipped 'write cio.json' step is visible: its flat_verdicts (declined
+                # edge-aligned setups) are then lost to the learning loop.
+                print(f"WARNING: cycle {args.cycle} cio.json MISSING on the strategic loop — the "
+                      f"CIO's flat_verdicts were NOT journaled (the enabling-lesson data source is "
+                      f"lost for this cycle). Write state/cycle/{args.cycle}/cio.json.",
+                      file=sys.stderr)
+            _marks: dict = {}
+            try:
+                _ctx2 = load_output("state", args.cycle, "context")
+                _marks = {b.get("exchange_id"): b.get("last_close")
+                          for b in (_ctx2.get("briefs") or []) if b.get("exchange_id")}
+            except FileNotFoundError:
+                pass
+            record_cycle_flat_verdicts("memory", args.cycle, _cioj.get("flat_verdicts") or [],
+                                       now, regime=_reg, marks=_marks)
+        except Exception as _e:  # noqa: BLE001
+            print(f"WARNING: flat-verdict bridge failed (non-fatal): {_e!r}", file=sys.stderr)
+        try:
+            from futures_fund.reflect_runner import reflect_and_record
+            # dsr_pvalue=None -> each lesson is gated on its OWN cell's DSR (Phase 3), not the
+            # desk-wide track record. A cell-specific rule can't validate until that cell is proven.
+            _summary = reflect_and_record("memory", now, args.cycle, dsr_pvalue=None)
+            print(f"LEARN: reflect cycle {args.cycle} (per-cell DSR) -> {_summary}",
+                  file=sys.stderr)
+        except Exception as _e:  # noqa: BLE001
+            print(f"WARNING: reflect pass failed (non-fatal): {_e!r}", file=sys.stderr)
     # Run-markers consumed by scripts/due_check.py (poll candle gate). candle = the served candle of
     # this loop's OWN timeframe (floor of the gate-start), so the per-loop due-gate sees it served;
     # ran_at = audit/clock-skew sentinel. (Strategic 1h: floor_tf(now,60); the legacy 4h path: 240.)

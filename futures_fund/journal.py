@@ -87,14 +87,28 @@ def _all_files(memory_dir) -> list[Path]:
     return sorted(d.glob("journal-*.jsonl")) if d.exists() else []
 
 
+def _loads_lines(text: str) -> list[dict]:
+    """Parse a JSONL blob defensively: a single malformed line (disk corruption / external edit)
+    is SKIPPED, never raised — the journal feeds both the trading audit (audit_and_reflect) and the
+    learning layer, and neither may crash the cycle over one bad line. Atomic writes make this rare;
+    this is the fail-safe floor under that."""
+    out: list[dict] = []
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        try:
+            out.append(json.loads(line))
+        except (json.JSONDecodeError, ValueError):
+            continue
+    return out
+
+
 def read_all_decisions(memory_dir) -> list[dict]:
     """All decision records as raw dicts. NOTE: datetime fields (ts, exit_ts) are ISO-8601
     STRINGS here, not datetime objects — call Decision.model_validate(r) for typed access."""
     out: list[dict] = []
     for f in _all_files(memory_dir):
-        for line in f.read_text().splitlines():
-            if line.strip():
-                out.append(json.loads(line))
+        out.extend(_loads_lines(f.read_text()))
     return out
 
 
@@ -107,7 +121,7 @@ def patch_outcome(memory_dir, decision_id: str, outcome: dict) -> bool:
     """Merge Phase-2 outcome fields into the decision with `decision_id`. Rewrites the
     containing monthly file. Returns False if the id is not found."""
     for f in _all_files(memory_dir):
-        records = [json.loads(line) for line in f.read_text().splitlines() if line.strip()]
+        records = _loads_lines(f.read_text())
         hit = False
         for r in records:
             if r.get("id") == decision_id:

@@ -49,7 +49,10 @@ def test_full_orchestration_dry_run_with_fixture_agents(tmp_path):
     (fixture trader proposal) -> gate/execute. Proves the plumbing with no live LLM."""
     state_dir, memory_dir = tmp_path / "s", tmp_path / "m"
     ex = FakeExchange({"BTC/USDT:USDT": _uptrend()})
-    settings = Settings(account_size_usdt=10_000.0, symbols=["BTC/USDT:USDT"], timeframe="4h")
+    # directional dry-run: it asserts a counter-regime short is armed as a trigger (the desk default
+    # market_neutral=True bypasses counter-regime confirmation).
+    settings = Settings(account_size_usdt=10_000.0, symbols=["BTC/USDT:USDT"], timeframe="4h",
+                        market_neutral=False)
     now = datetime(2026, 3, 1, tzinfo=UTC)
 
     # Phase 0-2: preflight produces briefs/context
@@ -101,3 +104,4 @@ def test_full_orchestration_dry_run_with_fixture_agents(tmp_path):
     # the per-cycle workspace persisted each stage (no silent runs)
     assert load_output(state_dir, 1, "context")["cycle"] == 1
     assert load_output(state_dir, 1, "screened")["symbols"] == ["BTCUSDT"]
+

@@ -8,7 +8,14 @@ from futures_fund.contracts import AgentProposal
 from futures_fund.orchestration import gate_execute_step, preflight_step
 from futures_fund.pending_orders import PendingOrder, load_pending_orders, save_pending_orders
 from futures_fund.state import load_positions
-from tests.test_orchestration import FakeExchange, _HttpClient, _settings, _uptrend
+from tests.test_orchestration import FakeExchange, _HttpClient, _uptrend
+from tests.test_orchestration import _settings as _base_settings
+
+
+def _settings():
+    # this suite exercises the DIRECTIONAL counter-regime feature, so run it in directional mode
+    # (the desk default is market_neutral=True, which bypasses counter-regime confirmation).
+    return _base_settings().model_copy(update={"market_neutral": False})
 
 NOW = dt.datetime(2026, 3, 1, tzinfo=UTC)
 
@@ -38,6 +45,15 @@ def test_preflight_emits_exposure(tmp_path):
     assert "exposure" in ctx
     for k in ("gross_long", "gross_short", "net", "tilt", "long_share"):
         assert k in ctx["exposure"]
+
+
+def test_preflight_emits_learning_blocks(tmp_path):
+    # the self-learning injections must always be present (lists; empty on a cold journal) so the
+    # desks/CIO can read lessons (Tier-2 rules) and episodic tail-risk (Tier-1 anti-press brake).
+    ex = FakeExchange({"BTC/USDT:USDT": _uptrend()})
+    ctx = _pf(tmp_path / "s", tmp_path / "m", ex)
+    assert isinstance(ctx.get("lessons"), list)
+    assert isinstance(ctx.get("episodic"), list)
 
 
 def test_gate_report_carries_post_trade_exposure(tmp_path):
@@ -92,6 +108,23 @@ def test_gate_takes_with_regime_long_at_market(tmp_path):
     report = gate_execute_step(ex, _settings(), state_dir, memory_dir, now=NOW, cycle_no=1,
                                proposals=[_long(last)], regime_state=_regime("risk_on"))
     assert report["opened"] == 1 and report["counter_regime_triggered"] == 0
+
+
+def test_malformed_with_regime_proposal_is_dropped_with_a_visible_reason(tmp_path):
+    # A WITH-regime long missing a REQUIRED AgentProposal field (`atr`/`confidence` — the live cy22
+    # Trader bug) must NOT vanish into a bare `dropped` count: the report must NAME the symbol AND
+    # the cause, so a flattened book is diagnosable instead of silent.
+    state_dir, memory_dir = tmp_path / "s", tmp_path / "m"
+    ex = FakeExchange({"BTC/USDT:USDT": _uptrend()})
+    last = _pf(state_dir, memory_dir, ex)["briefs"][0]["last_close"]
+    bad = {"symbol": "BTCUSDT", "direction": "long", "entry": last, "stop": last - 4.0,
+           "take_profits": [last + 8.0], "rationale": "no atr/confidence"}  # missing atr+confidence
+    report = gate_execute_step(ex, _settings(), state_dir, memory_dir, now=NOW, cycle_no=1,
+                               proposals=[bad], regime_state=_regime("risk_on"))
+    assert report["opened"] == 0 and report["dropped"] == 1
+    assert report.get("drop_reasons") and "BTCUSDT" in report["drop_reasons"][0]
+    assert "atr" in report["drop_reasons"][0].lower()
+    assert any("DROPPED" in w for w in report.get("warnings", []))
 
 
 def test_gate_mixed_regime_takes_both_at_market(tmp_path):
@@ -449,6 +482,63 @@ def test_gate_auto_cancels_stale_short_even_when_it_would_fire(tmp_path):
     assert report["triggers_fired"] == 0 and report["opened"] == 0
     assert load_pending_orders(state_dir) == []          # not persisted -> team re-arms next cycle
     assert any("auto-canceled STALE" in a for a in report.get("warnings", []))
+
+
+def _fresh_break(direction, n=25):
+    """A frame that CONSOLIDATES inside a tight range for the whole 20-bar window, then makes a
+    DECISIVE break ONLY on the last (firing) bar. So the PRIOR-bar swing is still at/inside the
+    range (healthy geometry) while the CURRENT swing — which folds in the firing bar's own
+    low/high — has crossed past the level. This is the fresh-break case the desk arms for."""
+    import pandas as pd
+    if direction == "short":   # support held at 110; last bar breaks down to low 102, close 105
+        close = [112.0] * (n - 1) + [105.0]
+        high = [114.0] * (n - 1) + [111.0]
+        low = [110.0] * (n - 1) + [102.0]
+    else:                       # resistance held at 90; last bar breaks up to high 98, close 95
+        close = [88.0] * (n - 1) + [95.0]
+        high = [90.0] * (n - 1) + [98.0]
+        low = [86.0] * (n - 1) + [89.0]
+    return pd.DataFrame({
+        "timestamp": pd.date_range("2026-01-01", periods=n, freq="4h", tz="UTC"),
+        "open": close, "high": high, "low": low, "close": close, "volume": 1.0,
+    })
+
+
+def test_gate_keeps_fresh_break_short_when_swing_crosses_on_firing_bar(tmp_path):
+    # REGRESSION (the user's flag): a breakdown SHORT armed at 109 with anchor 110 (support). The
+    # firing 4h bar closes 105 (< 109 -> FIRES) and its low 102 drags the CURRENT rolling swing_low
+    # to 102 (< line 108.5). The PRIOR-bar swing_low is still 110 (>= line) -> the structure broke
+    # ONLY this bar = a fresh decisive break, NOT a mid-bounce -> must FIRE, never auto-cancel.
+    state_dir, memory_dir = tmp_path / "s", tmp_path / "m"
+    ex = FakeExchange({"BTC/USDT:USDT": _fresh_break("short")})
+    _pf(state_dir, memory_dir, ex)
+    save_pending_orders(state_dir, [_armed("short", trigger=109.0, stop=113.0, tps=[100.0],
+                                           atr=2.0, anchor=110.0)])
+    report = gate_execute_step(ex, _settings(), state_dir, memory_dir, now=NOW, cycle_no=1,
+                               proposals=[], regime_state=_regime("risk_off"))
+    assert report["auto_canceled_stale"] == 0       # fresh break must NOT be stale-canceled
+    assert report["triggers_fired"] == 1 and report["opened"] == 1
+    pos = load_positions(state_dir)
+    assert len(pos) == 1 and pos[0].direction == "short"
+    assert abs(pos[0].entry - 109.0) < 0.5          # fills at ~L (trigger price + slippage)
+
+
+def test_gate_keeps_fresh_break_long_mirror(tmp_path):
+    # symmetric mirror: a breakout LONG armed at 91 with anchor 90 (resistance). The firing bar
+    # closes 95 (> 91 -> FIRES) and its high 98 lifts the CURRENT swing_high to 98 (> line 91.5);
+    # the PRIOR-bar swing_high is still 90 (<= line) -> fresh break -> must FIRE, never auto-cancel.
+    state_dir, memory_dir = tmp_path / "s", tmp_path / "m"
+    ex = FakeExchange({"BTC/USDT:USDT": _fresh_break("long")})
+    _pf(state_dir, memory_dir, ex)
+    save_pending_orders(state_dir, [_armed("long", trigger=91.0, stop=87.0, tps=[100.0],
+                                           atr=2.0, anchor=90.0)])
+    report = gate_execute_step(ex, _settings(), state_dir, memory_dir, now=NOW, cycle_no=1,
+                               proposals=[], regime_state=_regime("risk_on"))
+    assert report["auto_canceled_stale"] == 0
+    assert report["triggers_fired"] == 1 and report["opened"] == 1
+    pos = load_positions(state_dir)
+    assert len(pos) == 1 and pos[0].direction == "long"
+    assert abs(pos[0].entry - 91.0) < 0.5           # fills at ~L (trigger price + slippage)
 
 
 def test_gate_auto_cancels_stale_long_mirror(tmp_path):

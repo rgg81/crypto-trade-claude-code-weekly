@@ -1,7 +1,8 @@
-"""Exposure layer (DIRECTIONAL desk). book_exposure measures gross long $ vs gross short $ and the
-net tilt; exposure_warning is concentration TELEMETRY that fires only at EXTREME single-side tilt
-(>0.80) to flag accidental stacking of correlated unpaired legs — symmetric long/short. It does NOT
-pressure a hedge: a one-sided book is valid by design. No veto; visibility only."""
+"""Exposure layer (DOLLAR-NEUTRAL desk). book_exposure measures gross long vs short $ and the
+net tilt; exposure_warning is a TELEMETRY canary that fires EARLY (>0.30) when the book drifts off
+net~=0 — an independent check that the upstream neutral_book balancer worked (or was bypassed). It
+does NOT size or veto (the gate owns per-trade safety; neutrality is enforced upstream). Symmetric
+long/short; visibility only."""
 from datetime import UTC, datetime
 
 from futures_fund.portfolio import book_exposure, exposure_warning
@@ -61,17 +62,18 @@ def test_warning_is_symmetric_long_vs_short():
 
 
 def test_mild_tilt_below_threshold_no_warning():
-    # gross_long 110, gross_short 90 -> tilt 0.1 (< 0.80) -> tolerated, no telemetry
+    # gross_long 110, gross_short 90 -> tilt 0.1 (< 0.30) -> within the neutral band, no telemetry
     pos = [_pos("B", "long", 0.11, 1000.0), _pos("E", "short", 0.9, 100.0)]
     e = book_exposure(pos, {"B": 1000.0, "E": 100.0}, equity=10_000.0)
     assert round(e["tilt"], 4) == 0.1 and exposure_warning(e) is None
 
 
-def test_moderate_tilt_no_longer_warns_on_directional_desk():
-    # tilt 0.5 (gross_long 150 / gross_short 50) is fine for a directional desk -> silent (<0.80)
+def test_moderate_tilt_warns_on_neutral_desk():
+    # tilt 0.5 (gross_long 150 / gross_short 50) breaches the 0.30 neutral canary -> warns that the
+    # balancer let the book drift off net~=0 (on the aggressive desk this was silently tolerated)
     pos = [_pos("B", "long", 0.15, 1000.0), _pos("E", "short", 0.5, 100.0)]
     e = book_exposure(pos, {"B": 1000.0, "E": 100.0}, equity=10_000.0)
-    assert round(e["tilt"], 4) == 0.5 and exposure_warning(e) is None
+    assert round(e["tilt"], 4) == 0.5 and exposure_warning(e) is not None
 
 
 def test_mark_falls_back_to_entry_when_price_missing():

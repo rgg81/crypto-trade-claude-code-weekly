@@ -1,14 +1,15 @@
-# Operation TEMPEST-WEEKLY — non-secret runtime config. Secrets come from env (.env), never here.
-# AGGRESSIVE PAPER desk: target 5%/WEEK, ~50% drawdown tolerance, dual-loop (fast 15m + strategic 1h).
+# Operation TEMPEST-NEUTRAL — non-secret runtime config. Secrets come from env (.env), never here.
+# CONSERVATIVE DOLLAR-NEUTRAL PAPER desk: ~3%/MONTH, -15% drawdown limit, single 4h loop.
 account_size_usdt: 10000.0
 timeframe: "4h"            # regime ANCHOR timeframe (authoritative regime read is taken on 4h)
 symbol_count: 12
 deep_model: "opus"
 quick_model: "haiku"
-verdict_horizon_weeks: 8
-target_weekly: 0.05        # 5%/week mandate (drives the pacing engine)
-max_drawdown_tolerance: 0.50  # -50% hard force-flatten breaker
-# Dual-loop cadence: a fast intraday scalp loop + a strategic trend/swing loop on ONE paper account.
+verdict_horizon_months: 2
+target_monthly: 0.03       # ~3%/month mandate (drives the pacing engine)
+max_drawdown_tolerance: 0.15  # -15% hard force-flatten breaker
+# Single 4h strategic loop. The `fast` entry is kept INERT (never scheduled — run_loops.py is
+# strategic-only) so the protected run_exit_sweep machinery + its tests stay intact.
 loops:
   fast:
     timeframe: "15m"
@@ -22,9 +23,8 @@ loops:
     deep_model: "opus"
     poll_minutes: 5
 # Per-AGENT model (resolved at dispatch; overrides the loop tier). RULE: every agent that DECIDES
-# money runs on OPUS; only operational agents (narrating deterministic logic) run cheaper.
-# `scalper` is OPUS but GATED — dispatched only when the CIO granted intraday budget + a hot-list,
-# so Opus doesn't fire on every quiet 15m candle (the exit-sweep still runs every fire, for free).
+# money runs on OPUS; only operational agents (narrating deterministic logic) run cheaper. The
+# single 4h loop dispatches momentum/carry/news -> CIO -> Trader; the Scalper is RETIRED (no fast loop).
 agent_models:
   cio: "opus"
   trader: "opus"
@@ -32,7 +32,6 @@ agent_models:
   carry: "opus"
   news: "opus"
   sentiment: "opus"
-  scalper: "opus"
   reflector: "opus"
   pace_officer: "sonnet"
 # live: false => PAPER, FOREVER for this desk. Real mainnet market data (public, keyless), simulated

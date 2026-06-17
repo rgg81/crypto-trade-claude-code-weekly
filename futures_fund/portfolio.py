@@ -31,11 +31,11 @@ def open_heat(positions: list[Position], equity: float) -> float:
 # diversification nudge — when the book gets materially one-sided in risk-bearing legs, it suggests
 # adding a quality OTHER-side setup IF one exists, to reduce concentration. It is NEVER a reason to
 # stand flat: a single regime-aligned position with no available hedge is valid and expected.
-# Directional desk: this is TELEMETRY, not a neutrality nag. It fires only on EXTREME single-side
-# concentration (|net|/gross > 0.80 <=> one side > ~90% of risk-bearing gross), to flag accidental
-# stacking of correlated unpaired legs — NOT to pressure adding a hedge. The CIO may run a one-sided
-# book by design, so the bar is high and the message is informational.
-_TILT_WARN = 0.80
+# DOLLAR-NEUTRAL desk: this is a TELEMETRY tripwire (not a gate) that the upstream net~=0 enforcer
+# (neutral_book.py, non-protected) actually worked. The book SHOULD run |net|/gross near
+# 0, so this fires EARLY (>0.30) as an independent canary that the balancer failed or was bypassed —
+# it never sizes or vetoes (the gate owns per-trade safety; neutrality is enforced upstream).
+_TILT_WARN = 0.30
 
 
 def _is_risk_bearing(p: Position) -> bool:

@@ -25,9 +25,9 @@ def _seed(state_dir, memory_dir):
 def test_scorecard_has_headline_stats_and_target(tmp_path):
     state_dir, memory_dir = tmp_path / "s", tmp_path / "m"
     _seed(state_dir, memory_dir)
-    sc = build_scorecard(state_dir, memory_dir, weekly_target=0.05)
+    sc = build_scorecard(state_dir, memory_dir, monthly_target=0.03)
     assert sc["equity"] == 10_500.0
-    assert sc["weekly_target"] == 0.05
+    assert sc["monthly_target"] == 0.03
     assert "sharpe" in sc and "max_drawdown" in sc and "hit_rate" in sc
     assert sc["n_closed"] == 3
     assert sc["hit_rate"] > 0.5  # 2 of 3 wins
@@ -38,14 +38,14 @@ def test_scorecard_has_headline_stats_and_target(tmp_path):
 def test_scorecard_warns_in_drawdown(tmp_path):
     state_dir, memory_dir = tmp_path / "s", tmp_path / "m"
     ensure_memory_layout(memory_dir)
-    for i, eq in enumerate([10_000, 7_500], start=1):  # -25% drawdown (>=20% brake band)
+    for i, eq in enumerate([10_000, 7_500], start=1):  # -25% drawdown (>=10% brake band)
         record_equity(state_dir, datetime(2026, 5, 1, 4 * i, tzinfo=UTC), float(eq), cycle=i)
-    sc = build_scorecard(state_dir, memory_dir, weekly_target=0.05)
+    sc = build_scorecard(state_dir, memory_dir, monthly_target=0.03)
     assert any("drawdown" in w.lower() for w in sc["warnings"])
 
 
 def test_scorecard_empty_history_is_safe(tmp_path):
-    sc = build_scorecard(tmp_path / "s", tmp_path / "m", weekly_target=0.05)
+    sc = build_scorecard(tmp_path / "s", tmp_path / "m", monthly_target=0.03)
     assert sc["equity"] is None and sc["n_closed"] == 0
 
 
@@ -77,28 +77,28 @@ def _seed_idle_tradeable(state_dir, memory_dir, *, opened_recent=0, screened=("X
 def test_under_deployment_signal_fires_when_idle_with_candidates(tmp_path):
     s, m = tmp_path / "s", tmp_path / "m"
     _seed_idle_tradeable(s, m)
-    sc = build_scorecard(s, m, weekly_target=0.05)
+    sc = build_scorecard(s, m, monthly_target=0.03)
     assert any("under-deployed" in w for w in sc["warnings"]), sc["warnings"]
 
 
 def test_under_deployment_silent_when_holding_positions(tmp_path):
     s, m = tmp_path / "s", tmp_path / "m"
     _seed_idle_tradeable(s, m, positions=[{"symbol": "BTCUSDT"}])
-    sc = build_scorecard(s, m, weekly_target=0.05)
+    sc = build_scorecard(s, m, monthly_target=0.03)
     assert not any("under-deployed" in w for w in sc["warnings"])
 
 
 def test_under_deployment_silent_when_recent_opens(tmp_path):
     s, m = tmp_path / "s", tmp_path / "m"
     _seed_idle_tradeable(s, m, opened_recent=1)  # traded in the last 2 cycles
-    sc = build_scorecard(s, m, weekly_target=0.05)
+    sc = build_scorecard(s, m, monthly_target=0.03)
     assert not any("under-deployed" in w for w in sc["warnings"])
 
 
 def test_under_deployment_silent_when_no_candidates(tmp_path):
     s, m = tmp_path / "s", tmp_path / "m"
     _seed_idle_tradeable(s, m, screened=())  # thin tape — nothing to deploy into
-    sc = build_scorecard(s, m, weekly_target=0.05)
+    sc = build_scorecard(s, m, monthly_target=0.03)
     assert not any("under-deployed" in w for w in sc["warnings"])
 
 
@@ -106,7 +106,7 @@ def test_under_deployment_silent_in_drawdown(tmp_path):
     s, m = tmp_path / "s", tmp_path / "m"
     # peak 10000 -> current 7500 = -25% current drawdown (>=20%): accelerator must stay off
     _seed_idle_tradeable(s, m, equities=[10000, 9500, 9000, 8500, 8000, 7700, 7500])
-    sc = build_scorecard(s, m, weekly_target=0.05)
+    sc = build_scorecard(s, m, monthly_target=0.03)
     assert not any("under-deployed" in w for w in sc["warnings"])
     assert any("drawdown" in w.lower() for w in sc["warnings"])  # the brake still fires
 
@@ -114,7 +114,7 @@ def test_under_deployment_silent_in_drawdown(tmp_path):
 def test_under_deployment_silent_when_halted(tmp_path):
     s, m = tmp_path / "s", tmp_path / "m"
     _seed_idle_tradeable(s, m, halted=True)
-    sc = build_scorecard(s, m, weekly_target=0.05)
+    sc = build_scorecard(s, m, monthly_target=0.03)
     assert not any("under-deployed" in w for w in sc["warnings"])
 
 
@@ -122,7 +122,7 @@ def test_below_target_line_is_two_sided_not_pure_brake(tmp_path):
     s, m = tmp_path / "s", tmp_path / "m"
     # mildly underwater recent pace, healthy tier
     _seed_idle_tradeable(s, m, equities=[10000, 9970, 9950, 9960, 9955, 9950, 9948])
-    sc = build_scorecard(s, m, weekly_target=0.05)
+    sc = build_scorecard(s, m, monthly_target=0.03)
     pace = [w for w in sc["warnings"] if "pace" in w or "proven-edge" in w]
     assert pace, sc["warnings"]
     # the reworded line must NOT be the old unconditional 'do not force trades' brake

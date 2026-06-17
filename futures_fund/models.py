@@ -104,13 +104,13 @@ class PortfolioHealth(BaseModel):
 
     @property
     def tier(self) -> HealthTier:
-        # AGGRESSIVE WEEKLY bands: the desk presses through small drawdowns (its whole thesis), so
-        # 'caution' (halve caps) starts at -20% and 'stressed' (force flat) at -40% — leaving
-        # headroom before the -50% hard force-flatten breaker. (Monthly desk used 5%/10%.)
+        # CONSERVATIVE DOLLAR-NEUTRAL bands: a ~1x balanced book that draws down has a
+        # correlation/beta breakdown, so de-risk early — 'caution' (halve caps) at -5% and
+        # 'stressed' (force flat: no new risk) at -10%, ahead of the -15% force-flatten breaker.
         dd = self.drawdown_from_peak
-        if dd >= 0.40:
+        if dd >= 0.10:
             return "stressed"
-        if dd >= 0.20:
+        if dd >= 0.05:
             return "caution"
         return "healthy"
 

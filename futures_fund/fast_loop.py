@@ -17,14 +17,14 @@ records the served 15m candle.
 from __future__ import annotations
 
 import json
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from futures_fund.config import Settings
 from futures_fund.cycle import CycleContext, audit_and_reflect
 from futures_fund.monitor import check_positions
 from futures_fund.portfolio import portfolio_health
-from futures_fund.scheduling import floor_tf, tf_to_minutes
+from futures_fund.scheduling import floor_tf, last_served_candle, tf_to_minutes
 from futures_fund.state import (
     load_account,
     load_positions,
@@ -77,6 +77,96 @@ def _write_report(state_dir, cycle_no: int, report: dict) -> None:
     (d / "report.json").write_text(json.dumps(report, default=str))
 
 
+def _sliced_ctx(ctx: CycleContext, bar_open) -> CycleContext | None:
+    """A CycleContext whose every frame is truncated so its LAST row is the bar opening at
+    `bar_open` — i.e. `audit_and_reflect` (which reads `.iloc[-1]`) checks exactly that bar. Symbols
+    with no bar at `bar_open` are dropped (so a stale earlier bar is never mis-checked); None if no
+    held symbol has a bar there."""
+    frames, fundings, specs, raw_to_unified, specs_by_raw, prices = {}, {}, {}, {}, {}, {}
+    for unified, df in ctx.frames.items():
+        sub = df[df["timestamp"] <= bar_open]
+        if len(sub) == 0 or sub["timestamp"].iloc[-1] != bar_open:
+            continue
+        spec = ctx.specs[unified]
+        frames[unified] = sub
+        fundings[unified] = ctx.fundings[unified]
+        specs[unified] = spec
+        raw_to_unified[spec.symbol] = unified
+        specs_by_raw[spec.symbol] = spec
+        prices[spec.symbol] = float(sub["close"].iloc[-1])
+    if not frames:
+        return None
+    return CycleContext(ctx.settings, frames, fundings, specs, raw_to_unified, specs_by_raw, prices)
+
+
+def _opened_le(position, bar_open) -> bool:
+    """True if `position` already existed at `bar_open` (opened at/before the bar). Coerces a naive
+    opened_ts to UTC; an absent opened_ts -> True (pre-existing; don't suppress a check)."""
+    ot = getattr(position, "opened_ts", None)
+    if ot is None:
+        return True
+    bo = bar_open.to_pydatetime() if hasattr(bar_open, "to_pydatetime") else bar_open
+    if getattr(ot, "tzinfo", None) is None:
+        ot = ot.replace(tzinfo=UTC)
+    if getattr(bo, "tzinfo", None) is None:
+        bo = bo.replace(tzinfo=UTC)
+    return ot <= bo
+
+
+def _replay_missed_bars(ctx, positions, account, memory_dir, prev_open, current_open, tf, report):
+    """Downtime-gap backfill: replay every COMPLETED bar whose open lies strictly between
+    `prev_open` (the last actually-swept candle) and `current_open` (the forming bar), oldest-first,
+    so a stop/TP/liq that triggered while the desk was DOWN still closes — at that bar's price, with
+    funding accrued only to that bar's close. Reuses the PROTECTED `audit_and_reflect`/`detect_exit`
+    verbatim via frame slicing. Closing on the FIRST hitting bar is pessimistic (correct for a paper
+    fill). No-op (empty gap set) on normal cadence, so the live path is unchanged.
+
+    Two safety gates: (1) a bar is only exit-checked against positions that already EXISTED at its
+    open (`_opened_le`) — the fast anchor does NOT advance on a strategic open, so the gap window
+    can contain bars predating a just-opened position, and detect_exit has no opened_ts guard;
+    without this a pre-entry stop/liq/TP would spuriously close a position at a price never traded.
+    (2) If the outage predates the fetched OHLCV window, early bars can't be replayed -> alert
+    instead of silently dropping them."""
+    if not positions:
+        return positions
+    step = timedelta(minutes=tf_to_minutes(tf))
+    # PER-SYMBOL partial-window alert: a held symbol whose fetched history starts AFTER prev_open
+    # couldn't be replayed across the early gap. Check each symbol (NOT a global min — a deep symbol
+    # like BTC would otherwise mask a thin symbol's short window) and name it.
+    partial = sorted(
+        ctx.specs[u].symbol for u, df in ctx.frames.items()
+        if len(df) and df["timestamp"].iloc[0] > prev_open
+    )
+    if partial:
+        report.setdefault("alerts", []).append(
+            f"gap exceeds fetch window; early-outage bars unswept for {','.join(partial)}")
+    gap_ts = sorted({
+        ts for df in ctx.frames.values() for ts in df["timestamp"]
+        if prev_open < ts < current_open
+    })
+    for bar_open in gap_ts:
+        if not positions:
+            break
+        eligible = [p for p in positions if _opened_le(p, bar_open)]
+        deferred = [p for p in positions if not _opened_le(p, bar_open)]
+        if not eligible:
+            continue
+        ctx_i = _sliced_ctx(ctx, bar_open)
+        if ctx_i is None:
+            continue
+        bar_close = bar_open.to_pydatetime().astimezone(UTC) + step
+        # A throwaway sub-report: audit_and_reflect bumps carried for any eligible position whose
+        # symbol _sliced_ctx dropped at this bar (sym is None branch). That per-bar carried count is
+        # meaningless here (run_exit_sweep sets the true carried after the live sweep), so only the
+        # real closes/actions flow back — no polluted carried, no load-bearing coupling.
+        sub = {"closed": 0, "carried": 0, "actions": []}
+        survivors = audit_and_reflect(ctx_i, eligible, account, memory_dir, bar_close, sub)
+        report["closed"] += sub["closed"]
+        report["actions"].extend(sub["actions"])
+        positions = deferred + survivors
+    return positions
+
+
 def run_exit_sweep(exchange, settings: Settings, state_dir, memory_dir,
                    now: datetime, cycle_no: int, *, tf: str | None = None) -> dict:
     """Run one fast-loop exit sweep. Closes any held position whose latest fast candle hit
@@ -93,14 +183,46 @@ def run_exit_sweep(exchange, settings: Settings, state_dir, memory_dir,
 
     if _is_halted(state_dir):
         report["halted"] = True
-        _write_report(state_dir, cycle_no, report)
+        report["swept"] = False  # a halted no-sweep tick must NOT advance the backfill anchor:
+        _write_report(state_dir, cycle_no, report)  # else a stop/liq during the halt is missed
         return report
 
     if not positions:
-        _write_report(state_dir, cycle_no, report)  # nothing open -> nothing to sweep
+        # FLAT BOOK: no exits to sweep, but the -45% drawdown tripwire is a PURE equity check
+        # (equity vs peak), independent of open positions. Still evaluate it so (a) the report
+        # carries a real boolean should_halt (never None/ambiguous), and (b) a flat book sitting
+        # at >=45% drawdown still HALTS — blocking re-deploys into the hole before the -50%
+        # force-flatten. Reuse the module-level check_positions verbatim with an empty book (no
+        # liq alerts; only the dd_halt arm fires). Flat -> equity == realized balance (no unreal).
+        mon = check_positions([], {}, equity=account.balance, peak_equity=account.peak_equity,
+                              liq_buffer=0.03, dd_halt=0.45)
+        report["should_halt"] = mon["should_halt"]
+        report["alerts"] = list(report.get("alerts", [])) + list(mon["alerts"])
+        if mon["should_halt"]:
+            from futures_fund.state import set_halt
+            set_halt(state_dir, True,
+                     reason="fast monitor: -45% pre-flatten drawdown tripwire (flat book)")
+        report["swept"] = True  # empty book is a valid sweep (nothing to miss) -> anchor advances
+        _write_report(state_dir, cycle_no, report)
         return report
 
     ctx, prices = _held_context(exchange, settings, positions, tf)
+    # DOWNTIME-GAP backfill: if this fire follows an outage, completed bars went unswept. Replay
+    # them so a stop/TP/liq that triggered while the desk was down still closes (a missed mid-gap
+    # liquidation at 10x is the worst tail — the book would carry a position that no longer exists).
+    # No-op on normal 15m cadence (the gap set is empty), so the live path is unchanged. Anchor on
+    # the last ACTUALLY-SWEPT candle (require_swept) so a halt window's no-sweep ticks don't hide a
+    # mid-halt exit. FAIL-SAFE: any backfill error degrades to latest-bar-only, never crashes the
+    # load-bearing live exit check below.
+    tfm = tf_to_minutes(tf)
+    prev_served = last_served_candle(state_dir, now, tf_minutes=tfm, loop="fast",
+                                     require_swept=True)
+    if prev_served is not None:
+        try:
+            positions = _replay_missed_bars(ctx, positions, account, memory_dir,
+                                            prev_served, floor_tf(now, tfm), tf, report)
+        except Exception:  # noqa: BLE001 — backfill is best-effort; NEVER crash the live sweep
+            report.setdefault("alerts", []).append("gap-backfill skipped after internal error")
     positions = audit_and_reflect(ctx, positions, account, memory_dir, now, report)
 
     health = portfolio_health(account.balance, account.peak_equity, positions, prices)
@@ -123,8 +245,10 @@ def run_exit_sweep(exchange, settings: Settings, state_dir, memory_dir,
     # liq) — the actual 10x danger worth surfacing.
     mon = check_positions(pos_dicts, prices, equity=health.equity,
                           peak_equity=account.peak_equity, liq_buffer=0.03, dd_halt=0.45)
-    report["alerts"] = mon["alerts"]
+    # EXTEND (don't clobber) — preserve any backfill alert (partial-window / error) raised above.
+    report["alerts"] = list(report.get("alerts", [])) + list(mon["alerts"])
     report["should_halt"] = mon["should_halt"]
+    report["swept"] = True  # a full exit check ran -> this candle is a real anchor for backfill
     # ACTUALLY TRIP the tripwire: at -45% drawdown set the HALT flag so new opens are blocked before
     # the -50% force-flatten (a single gap can breach -50% between 15m sweeps); notify on any alert.
     if mon["should_halt"]:

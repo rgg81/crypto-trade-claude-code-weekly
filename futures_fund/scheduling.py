@@ -165,3 +165,47 @@ def cycle_due(state_dir, now_utc: datetime, *, tf_minutes: int = 240,
                 f"served {served.isoformat()}")
     except Exception as e:  # noqa: BLE001 — fail SAFE: never swallow a candle on an internal error
         return ("FRESH", 1, f"fail-safe DUE after internal error: {e!r}")
+
+
+def last_served_candle(state_dir, now_utc: datetime, *, tf_minutes: int,
+                       loop: str | None = None, require_swept: bool = False) -> datetime | None:
+    """The candle served by the most-recently-completed cycle of `loop`, or None if none exists.
+
+    This is the downtime-gap ANCHOR for the fast exit sweep: bars whose open lies strictly AFTER
+    this candle (and before the current forming candle) were never served and must be replayed
+    against open positions. Mirrors `cycle_due`'s trustworthy-report scan (descending dirs, first
+    parseable report wins; an egregiously-future candle is distrusted). Never raises -> None on any
+    internal error so the caller simply skips backfill rather than crashing the sweep.
+
+    `require_swept`: skip reports explicitly marked `swept == False` (a halted no-sweep tick). Those
+    advance the report sequence but ran NO exit check, so anchoring on them would hide a stop/liq
+    that triggered during the halt. A report lacking the field (legacy / a real sweep) counts."""
+    try:
+        assert now_utc.tzinfo is not None and now_utc.utcoffset() == timedelta(0), \
+            "now_utc must be tz-aware UTC"
+        boundary = floor_tf(now_utc, tf_minutes)
+        root = Path(state_dir) / loop / "cycle" if loop else Path(state_dir) / "cycle"
+        if not root.exists():
+            return None
+        dirs = sorted(
+            (int(p.name) for p in root.glob("*") if p.is_dir() and p.name.isdigit()),
+            reverse=True,
+        )
+        for n in dirs:
+            rp = root / str(n) / "report.json"
+            if not rp.exists():
+                continue
+            if require_swept:
+                try:
+                    rep = json.loads(rp.read_text())
+                except (json.JSONDecodeError, OSError, ValueError):
+                    continue
+                if isinstance(rep, dict) and rep.get("swept", True) is False:
+                    continue  # halted no-sweep tick -> not a real exit-check anchor
+            cand = _served_candle(rp, now_utc, tf_minutes)
+            if cand is None or cand > boundary + timedelta(minutes=tf_minutes):
+                continue  # unparseable, or egregiously-future (corrupt/skew) -> distrust
+            return cand
+        return None
+    except Exception:  # noqa: BLE001 — fail SAFE: no anchor -> caller skips backfill
+        return None

@@ -35,14 +35,14 @@ def test_defaults_when_no_file(tmp_path):
     assert s.data.fred_series == ["DTWEXBGS", "DGS10", "FEDFUNDS", "CPIAUCSL"]
 
 
-def test_weekly_and_loop_defaults(tmp_path):
-    # AGGRESSIVE WEEKLY desk: 5%/week target, ~50% drawdown tolerance, dual-loop cadence.
+def test_monthly_and_loop_defaults(tmp_path):
+    # CONSERVATIVE DOLLAR-NEUTRAL desk: ~3%/month target, -15% drawdown limit. The 'fast' loop entry
+    # is kept INERT (never scheduled) so the protected run_exit_sweep + its tests don't break.
     s = load_settings(tmp_path / "missing.yaml")
-    assert s.target_weekly == 0.05
-    assert s.max_drawdown_tolerance == 0.50
+    assert s.target_monthly == 0.03
+    assert s.max_drawdown_tolerance == 0.15
     assert s.live is False
     assert set(s.loops) == {"fast", "strategic"}
-    assert s.loops["fast"].timeframe == "15m"
     assert s.loops["strategic"].timeframe == "4h"
     assert s.loops["strategic"].regime_timeframe == "4h"
 
@@ -58,7 +58,7 @@ def test_yaml_loop_override(tmp_path):
 def test_deciding_agents_are_opus(tmp_path):
     # RULE: every agent that DECIDES money runs on Opus; only operational ones run cheaper.
     s = load_settings(tmp_path / "missing.yaml")
-    for role in ("cio", "trader", "momentum", "carry", "news", "sentiment", "scalper", "reflector"):
+    for role in ("cio", "trader", "momentum", "carry", "news", "sentiment", "reflector"):
         assert s.model_for(role) == "opus", role
     assert s.model_for("pace_officer") == "sonnet"  # operational: narrates deterministic pacing
 

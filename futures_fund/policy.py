@@ -6,17 +6,20 @@ from pydantic import BaseModel
 from futures_fund.models import PortfolioHealth, RegimeQuadrant, RegimeState, RiskCaps
 
 # Healthy-tier base caps per regime quadrant: (max_leverage, per_trade_risk_pct, max_heat).
-# AGGRESSIVE WEEKLY envelope (Operation TEMPEST-WEEKLY): the desk targets 5%/WEEK and tolerates
-# ~50% drawdown, so caps are far wider than the survival-first monthly desk. Leverage is still an
-# OUTPUT of geometry (sizing.choose_leverage searches DOWN from these caps to satisfy the
-# liq-distance floor); these are ceilings, never inputs. The deterministic gate remains the sole,
-# non-overridable risk authority — only the numbers move, not the mechanism.
+# CONSERVATIVE DOLLAR-NEUTRAL envelope (Operation TEMPEST-NEUTRAL): the desk targets ~3%/MONTH on a
+# dollar-neutral long/short book at LITERAL 1x PER POSITION (full isolated margin, so liquidation is
+# effectively unreachable — liq sits ~95% away, trivially clearing the 2.5x floor). max_leverage is
+# pinned to 1.0 across every quadrant; the dollar-neutral pre-sizer (futures_fund/neutral_book.py)
+# SHRINKS risk_mult toward a ~equity/2-per-side notional target, so gross stays ~1x of equity. These
+# are ceilings, never inputs; the deterministic gate remains the sole, non-overridable risk
+# authority. NOTE: position_risk/consolidate sum gross stop-risk and do NOT credit the long/short
+# offset, so max_heat is the binding deployment ceiling for a balanced book.
 _BASE_CAPS: dict[RegimeQuadrant, tuple[float, float, float]] = {
-    "low_vol_trend":  (10.0, 0.030, 0.40),
-    "high_vol_trend": (10.0, 0.025, 0.35),
-    "low_vol_range":  ( 8.0, 0.025, 0.35),
-    "high_vol_range": ( 6.0, 0.020, 0.30),
-    "transition":     ( 5.0, 0.015, 0.25),
+    "low_vol_trend":  (1.0, 0.015, 0.10),
+    "high_vol_trend": (1.0, 0.010, 0.08),
+    "low_vol_range":  (1.0, 0.010, 0.08),
+    "high_vol_range": (1.0, 0.005, 0.04),
+    "transition":     (1.0, 0.005, 0.04),
 }
 
 
@@ -46,34 +49,41 @@ class BreakerState(BaseModel):
 def circuit_breaker(
     daily_pnl_pct: float, weekly_pnl_pct: float, monthly_pnl_pct: float, dd_from_peak: float
 ) -> BreakerState:
-    """Hard circuit breakers — AGGRESSIVE WEEKLY posture. Thresholds are fractions (-0.20 = -20%).
+    """Hard circuit breakers — CONSERVATIVE DOLLAR-NEUTRAL posture. Thresholds are fractions
+    (-0.15 = -15%).
 
-    The desk is drawdown-tolerant (accepts ~50%), so the breakers sit far wider than the monthly
-    desk: a single -20% drawdown step-down (was -5%) and a -50% drawdown HARD STOP (force-flatten +
-    halt-new — the survival floor). Daily/weekly halts are loosened for a 10x intraday book but kept
-    as soft brakes; a -40% month is a secondary halt well inside the -50% flatten.
+    Progressive de-risk for a ~1x dollar-neutral book targeting ~3%/MONTH: a -5% drawdown step-down
+    (halve risk), a -10% reduce-only (stop new opens, hold/trim — a balanced book down 10% has a
+    correlation/beta breakdown), and the -15% drawdown HARD STOP (force-flatten + halt-new — the
+    user-set survival floor). Daily/weekly soft brakes are tight (-3%/-7%); parent -12% calendar-
+    month force-flatten is kept as an additive secondary (both strengthen — neither weakens).
     """
     allow_new = True
     force_flatten = False
     mult = 1.0
     reasons: list[str] = []
 
-    if dd_from_peak >= 0.20:           # step-down: halve risk past -20% from peak (was -5%)
+    if dd_from_peak >= 0.05:           # step-down: halve risk past -5% from peak
         mult = 0.5
-        reasons.append("dd>=20% step-down")
-    if dd_from_peak >= 0.50:           # HARD STOP: -50% drawdown force-flatten + halt-new
+        reasons.append("dd>=5% step-down")
+    if dd_from_peak >= 0.10:           # reduce-only: no new opens past -10% (hold/trim existing)
+        allow_new = False
+        mult = min(mult, 0.25)
+        reasons.append("dd>=10% reduce-only")
+    if dd_from_peak >= 0.15:           # HARD STOP: -15% drawdown force-flatten + halt-new
         allow_new = False
         force_flatten = True
-        reasons.append("dd>=50% force-flatten")
-    if daily_pnl_pct <= -0.10:         # loosened daily soft brake (was -3%)
+        reasons.append("dd>=15% force-flatten")
+    if daily_pnl_pct <= -0.03:         # daily soft brake
         allow_new = False
-        reasons.append("daily<=-10% halt-new")
-    if weekly_pnl_pct <= -0.20:        # weekly soft brake (was -7%)
+        reasons.append("daily<=-3% halt-new")
+    if weekly_pnl_pct <= -0.07:        # weekly soft brake
         allow_new = False
-        reasons.append("weekly<=-20% halt-new")
-    if monthly_pnl_pct <= -0.40:       # secondary monthly halt inside the -50% flatten
+        reasons.append("weekly<=-7% halt-new")
+    if monthly_pnl_pct <= -0.12:       # additive secondary calendar-month force-flatten
         allow_new = False
-        reasons.append("monthly<=-40% halt-new")
+        force_flatten = True
+        reasons.append("monthly<=-12% force-flatten")
     return BreakerState(allow_new_entries=allow_new, force_flatten=force_flatten,
                         risk_multiplier=mult, reason="; ".join(reasons))
 

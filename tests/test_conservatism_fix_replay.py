@@ -84,5 +84,5 @@ def test_accelerator_cannot_amplify_overtrading(tmp_path):
     # mirror an actively-trading cycle: holding a position
     s, m = tmp_path / "s", tmp_path / "m"
     _seed_idle_tradeable(s, m, positions=[{"symbol": "ETHUSDT"}], opened_recent=1)
-    sc = build_scorecard(s, m, weekly_target=0.05)
+    sc = build_scorecard(s, m, monthly_target=0.03)
     assert not any("under-deployed" in w for w in sc["warnings"])

@@ -14,7 +14,7 @@ from futures_fund.scorecard import build_scorecard
 
 def main() -> None:
     settings = load_settings()
-    sc = build_scorecard("state", "memory", weekly_target=0.05)
+    sc = build_scorecard("state", "memory", monthly_target=0.03)
     allowed = live_allowed(settings, sc)
     out = {
         "live_flag": getattr(settings, "live", False),

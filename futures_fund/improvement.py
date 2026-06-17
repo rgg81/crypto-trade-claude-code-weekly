@@ -1,8 +1,8 @@
 """Improvement metrics (Pillar 3 — IMPROVE: get sharper every cycle, and MEASURE it).
 
 The desk already learns (reflector -> lessons -> eval harness). This adds the missing measurement:
-is the desk actually getting better, and is it deploying toward 5%/week? Three read-only signals,
-surfaced each cycle so the team and the WEEKLY meta-reflection can see the trend:
+is the desk actually getting better, and is it deploying toward ~3%/month? Three read-only signals,
+surfaced each cycle so the team and the MONTHLY meta-reflection can see the trend:
 
 - DEPLOYMENT RATE — fraction of recent cycles that actually put risk on (opens or armed triggers).
   Directly measures the under-deployment that this whole pivot fixes; a near-zero rate is the alarm.

@@ -10,27 +10,26 @@ def _health(equity, peak):
 
 def test_healthy_low_vol_trend_is_full_caps():
     caps = caps_for(RegimeState(quadrant="low_vol_trend"), _health(10_000, 10_000))
-    assert caps.max_leverage == 10.0
-    assert caps.per_trade_risk_pct == pytest.approx(0.030)
-    assert caps.max_heat == pytest.approx(0.40)
+    assert caps.max_leverage == 1.0          # literal 1x per position (full margin, no liq risk)
+    assert caps.per_trade_risk_pct == pytest.approx(0.015)
+    assert caps.max_heat == pytest.approx(0.10)
     assert caps.bias == "normal"
 
 
 def test_high_vol_range_is_reduced():
     caps = caps_for(RegimeState(quadrant="high_vol_range"), _health(10_000, 10_000))
-    assert caps.max_leverage == 6.0
-    assert caps.per_trade_risk_pct == pytest.approx(0.020)
+    assert caps.max_leverage == 1.0          # 1x across every quadrant
+    assert caps.per_trade_risk_pct == pytest.approx(0.005)
 
 
 def test_caution_halves_caps():
-    # equity 7900/10000 -> dd 21% -> caution tier (>=20%); halve the healthy Q1 caps
-    caps = caps_for(RegimeState(quadrant="low_vol_trend"), _health(7_900, 10_000))
-    assert caps.max_leverage == pytest.approx(5.0)
-    assert caps.per_trade_risk_pct == pytest.approx(0.015)
+    # equity 9300/10000 -> dd 7% -> caution tier (>=5%, <10%); halve the healthy Q1 risk cap
+    caps = caps_for(RegimeState(quadrant="low_vol_trend"), _health(9_300, 10_000))
+    assert caps.per_trade_risk_pct == pytest.approx(0.0075)   # risk halved = the meaningful de-risk
 
 
 def test_stressed_forces_flat_bias_and_zero_risk():
-    caps = caps_for(RegimeState(quadrant="low_vol_trend"), _health(5_500, 10_000))  # dd 45% (>=40%)
+    caps = caps_for(RegimeState(quadrant="low_vol_trend"), _health(8_900, 10_000))  # dd 11% (>=10%)
     assert caps.bias == "flat"
     assert caps.per_trade_risk_pct == 0.0
 
@@ -38,25 +37,46 @@ def test_stressed_forces_flat_bias_and_zero_risk():
 def test_transition_regime_minimum_size():
     caps = caps_for(RegimeState(quadrant="transition"), _health(10_000, 10_000))
     assert caps.bias == "reduce"
-    assert caps.max_leverage <= 5.0
+    assert caps.max_leverage <= 2.0
 
 
 def test_circuit_breaker_daily_loss_halts_new():
-    state = circuit_breaker(daily_pnl_pct=-0.11, weekly_pnl_pct=-0.01, monthly_pnl_pct=-0.02,
-                            dd_from_peak=0.04)
+    state = circuit_breaker(daily_pnl_pct=-0.04, weekly_pnl_pct=-0.01, monthly_pnl_pct=-0.02,
+                            dd_from_peak=0.02)
     assert state.allow_new_entries is False
     assert state.risk_multiplier <= 1.0
 
 
-def test_circuit_breaker_step_down_halves_at_20pct_drawdown():
+def test_circuit_breaker_step_down_halves_at_5pct_drawdown():
     state = circuit_breaker(daily_pnl_pct=-0.01, weekly_pnl_pct=-0.02, monthly_pnl_pct=-0.03,
-                            dd_from_peak=0.21)
+                            dd_from_peak=0.07)
     assert state.risk_multiplier == pytest.approx(0.5)
+    assert state.allow_new_entries is True  # step-down only; opens still allowed below -10%
 
 
-def test_circuit_breaker_drawdown_force_flatten_at_50pct():
-    state = circuit_breaker(daily_pnl_pct=-0.02, weekly_pnl_pct=-0.05, monthly_pnl_pct=-0.10,
-                            dd_from_peak=0.55)
+def test_circuit_breaker_reduce_only_at_10pct_drawdown():
+    state = circuit_breaker(daily_pnl_pct=-0.01, weekly_pnl_pct=-0.02, monthly_pnl_pct=-0.03,
+                            dd_from_peak=0.11)
+    assert state.allow_new_entries is False      # reduce-only: no new opens
+    assert state.force_flatten is False          # but not yet flattening
+    assert state.risk_multiplier == pytest.approx(0.25)
+
+
+def test_circuit_breaker_force_flatten_boundary_at_15pct():
+    # T4: force_flatten FALSE at dd 0.14, TRUE at dd 0.15
+    just_under = circuit_breaker(daily_pnl_pct=-0.01, weekly_pnl_pct=-0.02, monthly_pnl_pct=-0.03,
+                                 dd_from_peak=0.14)
+    at_thresh = circuit_breaker(daily_pnl_pct=-0.01, weekly_pnl_pct=-0.02, monthly_pnl_pct=-0.03,
+                                dd_from_peak=0.15)
+    assert just_under.force_flatten is False
+    assert at_thresh.force_flatten is True
+    assert at_thresh.allow_new_entries is False
+
+
+def test_circuit_breaker_monthly_loss_force_flattens():
+    # additive secondary: a -12% calendar month force-flattens even at modest drawdown-from-peak
+    state = circuit_breaker(daily_pnl_pct=-0.01, weekly_pnl_pct=-0.05, monthly_pnl_pct=-0.12,
+                            dd_from_peak=0.04)
     assert state.force_flatten is True
     assert state.allow_new_entries is False
 
