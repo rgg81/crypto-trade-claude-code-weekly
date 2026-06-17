@@ -90,8 +90,11 @@ a held symbol) a `management` decision (hold/close/reduce, optional tighter trai
 `{proposals, management, triggers, cancel_triggers}` (empty `management` on stand-down is mandatory).
 
 **S7–10 — Gate + consolidate + execute (DETERMINISTIC).** `gate_execute_cli.py --cycle N --symbols
-<PICKS>`. Applies the adaptive gate (≤10x leverage as an OUTPUT, RR≥2, liq-distance≥2.5x, regime×
-health heat caps), gross-heat + CVaR consolidation, correlated-as-one cluster cap; opens/closes;
+<PICKS>`. Applies the adaptive gate (leverage an OUTPUT pinned to 1x for the neutral book, RR≥2,
+liq-distance≥2.5x, regime×health heat caps — max_heat is the binding ~1x ceiling), the dollar-neutral
+heat-aware pre-size+balance (drops a heat-starved leg and symmetrically trims the other side so the
+realized book stays net≈0; round-trip cost 0.14%/leg = 0.07%/fill ×2 taker+slippage), gross-heat +
+CVaR consolidation, correlated-as-one cluster cap; opens/closes;
 journals every decision (`loop:"strategic"` + originating `desk`) → `report.json`. Enforced regardless
 of agent output: HALT blocks new opens (closes still run); **-50% drawdown force-flattens** the book;
 malformed proposals are dropped; a kept HOLD is never re-stacked into a long+short. **You cannot

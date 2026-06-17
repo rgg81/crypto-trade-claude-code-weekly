@@ -911,22 +911,31 @@ def gate_execute_step(exchange, settings: Settings, state_dir, memory_dir,
             from futures_fund.baseline import simple_regime
             from futures_fund.policy import caps_for
             from futures_fund.portfolio import book_exposure
+            from futures_fund.portfolio_risk import position_risk
             _nh = portfolio_health(account.balance, account.peak_equity, positions, ctx.prices)
             _ncaps = caps_for(simple_regime(ctx.frames[ctx.settings.symbols[0]]), _nh)
             _nexp = book_exposure(positions, ctx.prices, _nh.equity)
+            # used HELD heat — the gate clamps each NEW leg to (max_heat - used_heat) of its OWN
+            # regime (risk_gate.evaluate). Mirror that sum (gross stop-risk of carried positions).
+            _used_heat = sum(position_risk(p.qty, p.entry, p.stop, _nh.equity, p.direction)
+                             for p in positions)
             # PER-LEG caps: the gate sizes each proposal with ITS OWN symbol's regime caps, so build
             # {raw_symbol: per_trade_risk_pct} the same way (else a leg whose regime differs from
-            # batch sizes off-target and blows the per-name cap — the BNB-concentration bug).
-            _ptr_by_sym = {}
+            # batch sizes off-target and blows the per-name cap — the BNB-concentration bug). Build
+            # {raw_symbol: heat headroom} = max(0, leg max_heat - used held heat) the SAME way, so
+            # the pre-sizer never targets a leg above the gate's per-leg heat clamp and then watches
+            # the gate asymmetrically starve it to dust (the cycle-2 net-short flip).
+            _ptr_by_sym, _heat_by_sym = {}, {}
             for _tp in trade_props:
                 _uni = ctx.raw_to_unified.get(_tp.symbol)
                 if _uni in ctx.frames:
-                    _ptr_by_sym[_tp.symbol] = caps_for(simple_regime(ctx.frames[_uni]),
-                                                       _nh).per_trade_risk_pct
+                    _lc = caps_for(simple_regime(ctx.frames[_uni]), _nh)
+                    _ptr_by_sym[_tp.symbol] = _lc.per_trade_risk_pct
+                    _heat_by_sym[_tp.symbol] = max(0.0, _lc.max_heat - _used_heat)
             trade_props, neutral_summary = presize_and_balance(
                 trade_props, equity=_nh.equity, per_trade_risk_pct=_ncaps.per_trade_risk_pct,
                 held_long=_nexp.get("gross_long", 0.0), held_short=_nexp.get("gross_short", 0.0),
-                risk_pct_by_symbol=_ptr_by_sym)
+                risk_pct_by_symbol=_ptr_by_sym, heat_headroom_by_symbol=_heat_by_sym)
         except Exception:  # noqa: BLE001 — neutral pre-size is advisory sizing; never break the gate
             neutral_summary = None
     # loop-aware attribution: the fast loop's opens come from the Scalper; the strategic loop's from

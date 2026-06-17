@@ -22,7 +22,8 @@ from futures_fund.notional_sizing import notional_to_risk_pct
 
 
 def presize_and_balance(props, *, equity, per_trade_risk_pct, held_long=0.0, held_short=0.0,
-                        gross_target=None, max_name_frac=0.25, risk_pct_by_symbol=None):
+                        gross_target=None, max_name_frac=0.25, risk_pct_by_symbol=None,
+                        heat_headroom_by_symbol=None, dust_risk_frac=0.001):
     """Stamp risk_mult on each new TradeProposal to target a dollar-neutral book.
 
     `props` — new TradeProposal objects (each carries direction/entry/stop/risk_mult).
@@ -32,8 +33,19 @@ def presize_and_balance(props, *, equity, per_trade_risk_pct, held_long=0.0, hel
     (default 0.25 = 25% of the book), so a scarce side can't be filled by one oversized leg into a
     squeeze-prone name (the N4 short-sleeve-concentration guard). A side with more legs than the cap
     allows simply equal-splits below it.
-    Returns (kept_props, summary): kept_props are copies with risk_mult set (zero-target legs
-    dropped); summary reports the per-side targets and the balanced gross.
+    `heat_headroom_by_symbol` — {raw symbol: available heat FRACTION} = max_heat(leg's OWN regime) -
+    used held heat, mirroring the gate's per-leg clamp (risk_gate.evaluate: effective_risk_pct =
+    min(risk_pct, max_heat - used_heat)). When supplied, each leg's target notional is capped to
+    what the gate will actually let it deploy, a leg whose deployable notional falls below the
+    consolidate dust floor (`dust_risk_frac`) is DROPPED (counted in `heat_dropped`, never silent),
+    and the OPPOSITE side is symmetrically TRIMMED so the realized gross_long$ == gross_short$ stays
+    balanced. This stops the cycle-2 failure: a balanced ~1x book saturates the heat cap, the gate
+    clamps a strict-regime long to dust while a loose-regime short opens full, and the book flips
+    net-short. Heat awareness keeps the book dollar-neutral under the heat ceiling. None =>
+    heat-blind (legacy behavior, unchanged).
+    Returns (kept_props, summary): kept_props are copies with risk_mult set (zero-target / dust /
+    heat-starved legs dropped); summary reports the per-side targets, the balanced gross, and any
+    heat-forced drops.
     """
     gross_target = equity if gross_target is None else gross_target
     side_target = max(0.0, gross_target) / 2.0
@@ -53,15 +65,62 @@ def presize_and_balance(props, *, equity, per_trade_risk_pct, held_long=0.0, hel
     per_long = min(tgt_long_total / len(longs), name_cap) if longs else 0.0
     per_short = min(tgt_short_total / len(shorts), name_cap) if shorts else 0.0
 
-    kept = []
-    for p in longs:
-        _stamp(kept, p, per_long, equity, _ptr(p, per_trade_risk_pct, risk_pct_by_symbol))
-    for p in shorts:
-        _stamp(kept, p, per_short, equity, _ptr(p, per_trade_risk_pct, risk_pct_by_symbol))
+    # HEAT-AWARE deployable notional per leg (None => heat-blind: no cap, no drop)
+    def _deployable(p, per_side):
+        n = per_side
+        if heat_headroom_by_symbol is not None:
+            n = min(n, _heat_notional(p, equity, heat_headroom_by_symbol))
+        return n
 
-    # actual per-side targets AFTER the per-name cap (per_leg may be capped below the equal split)
-    gross_long_target = held_long + per_long * len(longs)
-    gross_short_target = held_short + per_short * len(shorts)
+    def _is_dust(p, n):
+        return heat_headroom_by_symbol is not None and n < _dust_notional(p, equity, dust_risk_frac)
+
+    heat_dropped: list[str] = []
+    long_legs = [(p, _deployable(p, per_long)) for p in longs]
+    short_legs = [(p, _deployable(p, per_short)) for p in shorts]
+    # drop legs the heat ceiling starves below the consolidate dust floor (the gate would size them
+    # to dust and consolidate would drop them SILENTLY — surface it here and exclude them upstream)
+    def _viable(side_legs):
+        out = []
+        for p, n in side_legs:
+            if _is_dust(p, n):
+                heat_dropped.append(getattr(p, "symbol", "?"))
+            else:
+                out.append((p, n))
+        return out
+    long_legs, short_legs = _viable(long_legs), _viable(short_legs)
+
+    # SYMMETRIC TRIM so the realized finals balance: each side can only ADD what its viable legs can
+    # deploy; trim the side that could add more to keep held_long+L_add == held_short+S_add. Only
+    # applies when BOTH sides are PRESENT (held>0 or a viable new leg) — a deliberately one-sided
+    # submission still deploys (soft neutrality; the post-gate canary flags it), never trimmed to
+    # zero against an absent side.
+    l_ach = sum(n for _, n in long_legs)
+    s_ach = sum(n for _, n in short_legs)
+    long_present = held_long > 0 or l_ach > 0
+    short_present = held_short > 0 or s_ach > 0
+    if heat_headroom_by_symbol is not None and long_present and short_present:
+        final = min(held_long + l_ach, held_short + s_ach)
+        l_add, s_add = max(0.0, final - held_long), max(0.0, final - held_short)
+        l_scale = (l_add / l_ach) if l_ach > 0 else 0.0
+        s_scale = (s_add / s_ach) if s_ach > 0 else 0.0
+        long_legs = [(p, n * l_scale) for p, n in long_legs]
+        short_legs = [(p, n * s_scale) for p, n in short_legs]
+
+    kept = []
+    for p, n in long_legs:
+        _stamp(kept, p, n, equity, _ptr(p, per_trade_risk_pct, risk_pct_by_symbol))
+    for p, n in short_legs:
+        _stamp(kept, p, n, equity, _ptr(p, per_trade_risk_pct, risk_pct_by_symbol))
+
+    if heat_headroom_by_symbol is not None:
+        # actual per-side targets after heat-cap + symmetric trim
+        gross_long_target = held_long + sum(n for _, n in long_legs)
+        gross_short_target = held_short + sum(n for _, n in short_legs)
+    else:
+        # heat-blind: per-side targets after the per-name cap (legacy)
+        gross_long_target = held_long + per_long * len(longs)
+        gross_short_target = held_short + per_short * len(shorts)
     balanced = min(gross_long_target, gross_short_target)
     summary = {
         "gross_long_target": gross_long_target,
@@ -69,8 +128,30 @@ def presize_and_balance(props, *, equity, per_trade_risk_pct, held_long=0.0, hel
         "balanced_gross": balanced,
         "n_long": len(longs), "n_short": len(shorts),
         "n_kept": len(kept), "n_dropped": len(props) - len(kept),
+        "heat_dropped": heat_dropped,
     }
     return kept, summary
+
+
+def _heat_notional(p, equity, heat_headroom_by_symbol):
+    """Max notional the gate's per-leg heat clamp will allow this leg = headroom_frac * equity *
+    |entry| / |entry-stop| (inverse of position_risk = qty*|entry-stop|/equity at notional
+    qty*entry). Falls back to +inf when the leg has no headroom entry (treated as unconstrained)."""
+    h = heat_headroom_by_symbol.get(getattr(p, "symbol", None))
+    if not isinstance(h, (int, float)):
+        return float("inf")
+    dist = abs(p.entry - p.stop)
+    if dist <= 0 or equity <= 0:
+        return 0.0
+    return max(0.0, h) * equity * abs(p.entry) / dist
+
+
+def _dust_notional(p, equity, dust_risk_frac):
+    """The notional below which consolidate drops a leg as dust (position_risk < dust_risk_frac)."""
+    dist = abs(p.entry - p.stop)
+    if dist <= 0 or equity <= 0:
+        return 0.0
+    return dust_risk_frac * equity * abs(p.entry) / dist
 
 
 def _ptr(p, default_ptr, by_symbol):
