@@ -65,11 +65,18 @@ def presize_and_balance(props, *, equity, per_trade_risk_pct, held_long=0.0, hel
     per_long = min(tgt_long_total / len(longs), name_cap) if longs else 0.0
     per_short = min(tgt_short_total / len(shorts), name_cap) if shorts else 0.0
 
-    # HEAT-AWARE deployable notional per leg (None => heat-blind: no cap, no drop)
+    # HEAT- and RM-AWARE deployable notional per leg (None heat => heat-blind: legacy, no cap/drop).
+    # Two ceilings the gate will enforce that the equal-split target can EXCEED:
+    #   (1) heat headroom: min(risk_pct, max_heat(regime) - used_heat) — the cy2 starvation case;
+    #   (2) per-trade risk_mult clamp to (0,1]: a WIDE-stop leg whose target needs rm>1 is pinned at
+    #       rm=1.0, deploying only ptr*equity*entry/|entry-stop| — the cy1 wide-stop-long case.
+    # Cap the target by BOTH so the symmetric trim balances the realized book; else one sleeve
+    # (tight-stop / loose-regime) opens full while the other is clamped, and the book tilts.
     def _deployable(p, per_side):
         n = per_side
         if heat_headroom_by_symbol is not None:
-            n = min(n, _heat_notional(p, equity, heat_headroom_by_symbol))
+            n = min(n, _heat_notional(p, equity, heat_headroom_by_symbol),
+                    _rm1_notional(p, equity, _ptr(p, per_trade_risk_pct, risk_pct_by_symbol)))
         return n
 
     def _is_dust(p, n):
@@ -152,6 +159,17 @@ def _dust_notional(p, equity, dust_risk_frac):
     if dist <= 0 or equity <= 0:
         return 0.0
     return dust_risk_frac * equity * abs(p.entry) / dist
+
+
+def _rm1_notional(p, equity, per_trade_risk_pct):
+    """Max notional the leg can deploy under the gate's risk_mult clamp to (0,1]: at rm=1.0,
+    notional = per_trade_risk_pct * equity * |entry| / |entry-stop|. A WIDE-stop leg whose neutral
+    target exceeds this is pinned here by the gate (best-effort, never over-deploys), so the
+    pre-sizer caps the target to it and trims the opposite side to keep the book balanced."""
+    dist = abs(p.entry - p.stop)
+    if dist <= 0 or equity <= 0 or per_trade_risk_pct <= 0:
+        return 0.0
+    return per_trade_risk_pct * equity * abs(p.entry) / dist
 
 
 def _ptr(p, default_ptr, by_symbol):

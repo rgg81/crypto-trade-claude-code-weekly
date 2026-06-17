@@ -30,6 +30,36 @@ def _notional(tp, ptr):
     return qty_from_risk(_EQ, ptr * tp.risk_mult, tp.entry, tp.stop) * tp.entry
 
 
+def test_wide_stop_longs_rm_clamped_do_not_flip_book_net_short():
+    # Cycle-1 (post-reset) regression: a FRESH flat book of WIDE-stop high-vol-alt longs
+    # (~7-10% stops) cannot reach the equity/2 target -- hitting it needs risk_mult > 1, which the
+    # gate clamps to 1.0 (per-trade risk ceiling) -> each long deploys ~ptr*equity*entry/|stop|,
+    # well under target. TIGHT-stop shorts (~1.5-3% stops) hit target easily. Without rm-clamp
+    # awareness the longs come in ~$3.6k vs shorts ~$5k -> the book flips ~16% net-SHORT.
+    # The pre-sizer must cap each leg by its rm=1.0 notional and SYMMETRICALLY trim the other side.
+    longs = [_tp("WLDUSDT", "long", 0.6404, 0.5772), _tp("UNIUSDT", "long", 3.189, 2.8887),
+             _tp("HYPEUSDT", "long", 72.258, 67.4736)]            # ~7-10% stops
+    shorts = [_tp("BNBUSDT", "short", 599.02, 617.5), _tp("DOGEUSDT", "short", 0.08537, 0.087875),
+              _tp("BTCUSDT", "short", 64271.3, 65250.0)]           # ~1.5-3% stops
+    ptr_by = {"WLDUSDT": 0.01, "UNIUSDT": 0.01, "HYPEUSDT": 0.01,
+              "BNBUSDT": 0.015, "DOGEUSDT": 0.01, "BTCUSDT": 0.005}
+    heat_by = {s: 0.10 for s in ptr_by}   # ample heat -> isolate the rm=1.0 clamp
+    kept, summary = presize_and_balance(
+        longs + shorts, equity=_EQ, per_trade_risk_pct=0.01, held_long=0.0, held_short=0.0,
+        risk_pct_by_symbol=ptr_by, heat_headroom_by_symbol=heat_by)
+
+    gl = sum(_notional(t, ptr_by[t.symbol]) for t in kept if t.direction == "long")
+    gs = sum(_notional(t, ptr_by[t.symbol]) for t in kept if t.direction == "short")
+    # longs deploy at their rm=1.0 ceilings (~$3.6k total); shorts TRIMMED to match -> net ~0
+    assert gl == pytest.approx(gs, rel=0.03), f"book not neutral: long {gl:.0f} vs short {gs:.0f}"
+    tilt = abs(gl - gs) / (gl + gs)
+    assert tilt < 0.03, f"tilt {tilt:.3f} too high"
+    # every long is at its rm=1.0 ceiling (risk_mult pinned to ~1.0, the binding cap)
+    for t in kept:
+        if t.direction == "long":
+            assert t.risk_mult == pytest.approx(1.0, abs=1e-6)
+
+
 def test_heat_starved_long_does_not_flip_book_net_short():
     # Held book net +800 long (held_long 4400 vs held_short 3600), already ~saturating heat.
     # New L (long, high_vol_range, ~0 headroom) + S (short, high_vol_trend, room). Without heat
