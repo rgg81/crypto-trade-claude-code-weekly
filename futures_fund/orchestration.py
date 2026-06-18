@@ -432,6 +432,16 @@ def management_review(payload: dict) -> list[dict]:
     return [] if m is None else m
 
 
+def _surviving_for_presize(positions, force_close):
+    """The carried positions that SURVIVE this cycle's management-close set — used to compute the
+    held long/short notional + heat the dollar-neutral pre-sizer sizes new legs against. Excluding
+    the closing legs makes a SWAP (close A + open B) size B to refill the vacated side (net~0), not
+    tiny (which would flip the book net-short once A closes). Empty close-set => unchanged."""
+    if not force_close:
+        return positions
+    return [p for p in positions if getattr(p, "symbol", None) not in force_close]
+
+
 def _fold_raw_symbols(exchange, settings: Settings, raw_symbols) -> Settings:
     """Fold extra RAW symbols (e.g. pending-trigger symbols) into the universe so their 4h bars
     are fetched and the trigger can be evaluated — same mechanism working_universe uses for held."""
@@ -914,11 +924,17 @@ def gate_execute_step(exchange, settings: Settings, state_dir, memory_dir,
             from futures_fund.portfolio_risk import position_risk
             _nh = portfolio_health(account.balance, account.peak_equity, positions, ctx.prices)
             _ncaps = caps_for(simple_regime(ctx.frames[ctx.settings.symbols[0]]), _nh)
-            _nexp = book_exposure(positions, ctx.prices, _nh.equity)
+            # SWAP NETTING: size new legs against the book that SURVIVES this cycle's closes. A leg
+            # in `force_close` (e.g. the CIO rotating HYPE->XPL) is about to leave, so counting it
+            # in held_long/held_short would size its replacement tiny (long side looks full) and
+            # flip the book net-short once it closes. Equity (_nh) stays full-book (the close just
+            # realizes PnL); only the per-side held notional + heat exclude the closing legs.
+            _surviving = _surviving_for_presize(positions, force_close)
+            _nexp = book_exposure(_surviving, ctx.prices, _nh.equity)
             # used HELD heat — the gate clamps each NEW leg to (max_heat - used_heat) of its OWN
-            # regime (risk_gate.evaluate). Mirror that sum (gross stop-risk of carried positions).
+            # regime (risk_gate.evaluate). Mirror that sum over the SURVIVING carried positions.
             _used_heat = sum(position_risk(p.qty, p.entry, p.stop, _nh.equity, p.direction)
-                             for p in positions)
+                             for p in _surviving)
             # PER-LEG caps: the gate sizes each proposal with ITS OWN symbol's regime caps, so build
             # {raw_symbol: per_trade_risk_pct} the same way (else a leg whose regime differs from
             # batch sizes off-target and blows the per-name cap — the BNB-concentration bug). Build
