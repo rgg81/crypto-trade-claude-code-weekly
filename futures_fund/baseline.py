@@ -96,10 +96,18 @@ def swing_levels(df: pd.DataFrame, lookback: int = 20) -> tuple[float, float]:
 
 def simple_regime(df: pd.DataFrame) -> RegimeState:
     close = df["close"]
+    if len(close) == 0:
+        return RegimeState(quadrant="high_vol_range", trend_direction="neutral")
     ema = close.ewm(span=_EMA_SPAN, adjust=False).mean()
-    slope = (ema.iloc[-1] - ema.iloc[-6]) / 5.0
-    norm_slope = slope / close.iloc[-1]
+    # ROBUST to short history (a freshly-listed symbol with <6 4h bars): measure the per-bar EMA
+    # slope over the AVAILABLE lookback (up to 6 bars) instead of a fixed -6 that may not exist.
+    lb = min(6, len(ema))
+    slope = (ema.iloc[-1] - ema.iloc[-lb]) / (lb - 1) if lb >= 2 else 0.0
+    last = float(close.iloc[-1])
+    norm_slope = slope / last if last else 0.0
     vol = float(close.pct_change().tail(_EMA_SPAN).std())
+    if vol != vol:  # NaN (too few points to compute a std) -> treat as calm
+        vol = 0.0
     trending = abs(norm_slope) > _TREND_EPS
     high_vol = vol > 0.01
     direction = "up" if norm_slope > 0 else "down" if norm_slope < 0 else "neutral"
