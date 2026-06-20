@@ -41,7 +41,7 @@ def main() -> None:
     ap.add_argument("--cycle", type=int, required=True)
     ap.add_argument("--n-per-side", type=int, default=3)
     ap.add_argument("--state", default="state")
-    ap.add_argument("--keep-buffer", type=int, default=1)
+    ap.add_argument("--keep-buffer", type=int, default=2)   # stickier book = minimum rebalance
     ap.add_argument("--swap-margin", type=float, default=0.5)
     args = ap.parse_args()
 
