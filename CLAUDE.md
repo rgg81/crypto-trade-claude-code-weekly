@@ -8,10 +8,19 @@ over a deterministic Python gate (`futures_fund/`) that owns all math/risk/execu
 real Binance USD-M mainnet data, on a **single 4h loop**, under a single-flight run lock.
 
 **Mandate: ~3% per MONTH, net of all costs (a CEILING the edge must clear, not a quota). DOLLAR-NEUTRAL
-— gross long $ == gross short $ at ~1x gross (no leverage). Conservative: −15% force-flatten.** The
-edge is cross-sectional **momentum dispersion** (long relative-strength / short relative-weakness),
-with funding **carry** as a secondary tiebreaker — **never short a hot high-funding name to harvest
-carry** (Phase-0 lesson: that sleeve net-loses). PAPER ONLY — `live` stays false, forever.
+— gross long $ == gross short $ at ~1x gross (no leverage). Conservative: −15% force-flatten.**
+
+**The edge is an ALL-WEATHER BLENDED cross-sectional score (`futures_fund/blended_score.py`,
+`scripts/blended_book_cli.py`) — the desk profits in EVERY regime, not just when momentum disperses.
+Each liquid non-pump name scores `w_mom·z(momentum_20) + w_carry·z(−annualized_funding) + w_mr·z(50−rsi)`;
+LONG the top-N, SHORT the bottom-N, equal-$. The regime shifts the weights: a dispersed/trending tape →
+momentum-led; a flat/compressed tape → FUNDING-CARRY-led (carry is paid every settlement regardless of
+price, so it carries the book through flat markets) + mean-reversion. A momentum-consistency GATE means
+carry/mean-reversion only REINFORCE a clear trend, never FLIP it — never short a hot high-funding PUMPING
+name, never catch a falling knife for funding (Phase-0 lesson: that net-loses). The desk is ALWAYS
+DEPLOYED — NEVER FLAT (a flat book abandons the edge; there is always a top and a bottom to pair). A
+HYSTERESIS keep-band gives MINIMUM REBALANCE: a held in-band leg is kept; only legs that rotate off their
+side are closed and refilled.** PAPER ONLY — `live` stays false, forever.
 
 ---
 

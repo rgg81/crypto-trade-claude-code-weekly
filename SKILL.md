@@ -39,6 +39,19 @@ Prints `DUE FRESH/RETRY <N>` (run the playbook with cycle number `N`) or `SKIP:`
 
 ## STRATEGIC playbook (4h) — desks → CIO → Trader → gate → reflect
 
+**S0 — ALL-WEATHER BLENDED SELECTION is the PRIMARY path (`scripts/blended_book_cli.py`).** The
+long/short book is chosen DETERMINISTICALLY by the blended cross-sectional score
+(`futures_fund/blended_score.py`): `w_mom·z(momentum_20) + w_carry·z(−annualized_funding) +
+w_mr·z(50−rsi)`, regime-weighted (dispersed→momentum-led, flat→carry+mean-reversion-led), with a
+momentum-consistency gate (carry/MR only reinforce a clear trend) and pump/illiquid exclusion. After
+preflight, run `blended_book_cli --cycle N` — it ranks the universe, applies the HYSTERESIS rotation
+vs the held book (keep in-band legs → MINIMUM REBALANCE), structures the new legs (ATR stop, ≥2.2R),
+and writes `cio.json` + `proposals.json`. The desk is ALWAYS DEPLOYED — NEVER FLAT (verify n_long≥1 AND
+n_short≥1 after the gate). The Opus desks are now an OVERLAY, not the selector: dispatch **News** for
+the market-wide `risk_off_flag` + pump/false-tag veto; momentum & carry are subsumed by the score. The
+gate still owns all sizing/risk; calc-vigilance still re-derives neutrality + every RR. (The legacy
+desks→CIO→Trader path below remains valid for hand-built books and as documentation.)
+
 **S1 — Scout + preflight.** `scout_cli.py --cycle N --top 30` → universe. `preflight.py --cycle N
 --symbols <UNIVERSE>` → audits closes (stop/TP/liq), folds in every held symbol, builds per-symbol
 briefs (indicators, structure, funding/OI/L-S, holding cards) + market context + the deterministic 4h
