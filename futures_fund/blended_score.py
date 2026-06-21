@@ -34,7 +34,12 @@ PUMP_MOM_HARD = 0.50
 
 # Regime weight presets (must each sum to 1.0). Picked by cross-sectional momentum dispersion.
 _TREND_W = {"mom": 0.55, "carry": 0.35, "mr": 0.10}
-_RANGE_W = {"mom": 0.20, "carry": 0.50, "mr": 0.30}
+# In a flat tape carry CO-LEADS (the direction-agnostic edge that still pays), but momentum keeps an
+# equal voice so the ranking stays stable (momentum is more persistent cycle-to-cycle than
+# funding/RSI) — this prevents thrash, quality majors being dumped for microcaps on funding alone, and
+# MR shorting a strong-momentum leader on RSI. MR is the smallest weight (riskiest edge — fading a
+# trend can lose big), firing mainly on genuine RSI extremes.
+_RANGE_W = {"mom": 0.40, "carry": 0.40, "mr": 0.20}
 _TREND_DISPERSION = 0.05   # std(momentum_20) >= 5% -> momentum is "in season"
 
 # A name whose |momentum_20| >= this is "clearly trending"; carry and mean-reversion may then only
