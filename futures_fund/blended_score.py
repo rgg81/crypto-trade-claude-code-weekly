@@ -27,6 +27,10 @@ from statistics import pstdev
 MIN_OI_USD = 50e6          # below this notional OI a name is an illiquid microcap -> NO-TOUCH
 PUMP_MOM = 0.30            # +30% over 20 bars ...
 PUMP_RSI = 72.0           # ... with RSI > 72 = a parabolic blow-off -> NO-TOUCH
+# |20-bar move| >= 50% is parabolic/degenerate REGARDLESS of RSI -> NO-TOUCH. (RSI mean-reverts
+# faster than 20-bar momentum, so a cooled-RSI pump like a +100% name at RSI 62 slips the soft rule
+# AND distorts the whole cross-section's z-scores.)
+PUMP_MOM_HARD = 0.50
 
 # Regime weight presets (must each sum to 1.0). Picked by cross-sectional momentum dispersion.
 _TREND_W = {"mom": 0.55, "carry": 0.35, "mr": 0.10}
@@ -77,7 +81,9 @@ def is_tradeable(brief: dict, min_oi: float = MIN_OI_USD) -> bool:
         return False
     mom = _num(brief.get("momentum_20"))
     rsi = _num(brief.get("rsi"), 50.0)
-    if mom >= PUMP_MOM and rsi >= PUMP_RSI:   # parabolic blow-off
+    if abs(mom) >= PUMP_MOM_HARD:             # parabolic/degenerate move regardless of RSI
+        return False
+    if mom >= PUMP_MOM and rsi >= PUMP_RSI:   # softer parabolic blow-off
         return False
     return True
 

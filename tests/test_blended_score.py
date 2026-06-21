@@ -51,6 +51,15 @@ def test_is_tradeable_excludes_parabolic_pump():
     assert not bs.is_tradeable(pump)
 
 
+def test_is_tradeable_excludes_parabolic_pump_even_when_rsi_cooled():
+    # BTW-shape: +104% over 20 bars but RSI cooled to 62 and OI clears the floor. The soft rule
+    # (mom>=0.30 AND rsi>=72) misses it; a hard momentum ceiling must still exclude the parabola
+    # (it would also distort the whole cross-section's z-scores).
+    assert not bs.is_tradeable(_brief("BTWUSDT", mom=1.047, rsi=62, oi=68e6))
+    # symmetric: a -50%+ collapse is degenerate too
+    assert not bs.is_tradeable(_brief("CRASHUSDT", mom=-0.6, rsi=40, oi=200e6))
+
+
 def test_is_tradeable_excludes_illiquid_microcap():
     tiny = _brief("BSBUSDT", mom=-0.28, rsi=45, oi=20e6)  # below the OI floor
     assert not bs.is_tradeable(tiny)
