@@ -157,56 +157,69 @@ def select_book(scored: list[dict], n_per_side: int = 3) -> tuple[list[str], lis
 
 
 def apply_hysteresis(scored: list[dict], holdings: dict[str, str], n_per_side: int = 3,
-                     keep_buffer: int = 1, swap_margin: float = 0.5) -> dict:
-    """Minimum-rebalance rotation.
+                     keep_buffer: int = 2, swap_margin: float = 0.5) -> dict:
+    """Minimum-rebalance rotation with a SWAP MARGIN (the core anti-churn mechanism).
 
-    Keep a held leg as long as it stays on its own side within the top/bottom
-    (n_per_side+keep_buffer) ranks. Close it only if it has crossed to the wrong side (a held long
-    now in the bottom half, or a short in the top half) or fell out of the buffer. Refill vacated
-    slots from the best
-    available non-held name on that side, but ONLY if it beats the weakest kept leg by `swap_margin`
-    (so a fresh name that barely edges a held one does not trigger churn).
+    The target sleeves are the top-N (long) / bottom-N (short) by score, but a HELD leg is only
+    rotated OUT when a challenger beats it by `swap_margin` in side-score terms (long: +score,
+    short: −score) — so a compressed cross-section of near-tied scores does NOT churn the book. A
+    held leg that has crossed to the OTHER sleeve is closed (it cannot same-cycle flip — the gate
+    can't reliably close+reopen the same symbol opposite in one pass, so it re-enters next cycle).
+    `keep_buffer` is reserved (the swap margin now provides stickiness, not a rank band).
     """
-    rank = {s["symbol"]: i for i, s in enumerate(scored)}
-    total = len(scored)
-    long_band = n_per_side + keep_buffer            # ranks [0 .. long_band) are "long-side keepers"
-    short_band_start = total - (n_per_side + keep_buffer)
+    _ = keep_buffer
+    score = {s["symbol"]: s["score"] for s in scored}
+    present = set(score)
 
-    keep_long, keep_short, close = [], [], []
-    for sym, direction in holdings.items():
-        r = rank.get(sym)
-        if r is None:                                # name left the universe -> close
-            close.append(sym)
-        elif direction == "long" and r < long_band and r < total / 2:
-            keep_long.append(sym)
-        elif direction == "short" and r >= short_band_start and r >= total / 2:
-            keep_short.append(sym)
-        else:
-            close.append(sym)                        # crossed sides / fell out of band
+    def side_val(sym: str, direction: str) -> float:
+        return score[sym] if direction == "long" else -score[sym]
 
-    # Refill the gaps left by kept+closed legs with the best available UNHELD names on each side.
-    # Anti-churn is the keep-band (a held in-band leg is kept, so it never frees a slot to thrash);
-    # a vacated slot just takes the best candidate. `swap_margin` is reserved for future
-    # displacement logic (rotate a buffer-zone leg only when beaten by a wide margin).
-    _ = swap_margin
-    open_long, open_short = [], []
-    held = set(holdings)
+    close = [s for s in holdings if s not in present]      # left the universe
 
-    need_long = n_per_side - len(keep_long)
-    for s in scored:                                 # best-scoring first
-        if need_long <= 0:
-            break
-        if s["symbol"] not in held:
-            open_long.append(s["symbol"])
-            need_long -= 1
+    def build(direction: str) -> list[str]:
+        # candidates exclude names held on the OPPOSITE sleeve (no same-cycle flip)
+        opp = "short" if direction == "long" else "long"
+        cands = sorted([s for s in present if holdings.get(s) != opp],
+                       key=lambda s: side_val(s, direction), reverse=True)
+        held = sorted([s for s, d in holdings.items()
+                       if d == direction and s in present and s not in close],
+                      key=lambda s: side_val(s, direction), reverse=True)
+        book = held[:n_per_side]                            # keep held legs first
+        for c in cands:                                     # fill empty slots with the best unheld
+            if len(book) >= n_per_side:
+                break
+            if c not in book and holdings.get(c) != direction:
+                book.append(c)
+        # improvement swaps: a non-held challenger displaces the weakest HELD member only if it
+        # beats it by swap_margin (otherwise the near-tie held leg stays -> minimum rebalance)
+        improved = True
+        while improved:
+            improved = False
+            held_in_book = [s for s in book if holdings.get(s) == direction]
+            if not held_in_book:
+                break
+            weakest = min(held_in_book, key=lambda s: side_val(s, direction))
+            for c in cands:
+                if c in book or holdings.get(c) == direction:
+                    continue
+                if side_val(c, direction) > side_val(weakest, direction) + swap_margin:
+                    book.remove(weakest)
+                    book.append(c)
+                    improved = True
+                    break
+        return book
 
-    need_short = n_per_side - len(keep_short)
-    for s in reversed(scored):                        # lowest-scoring first
-        if need_short <= 0:
-            break
-        if s["symbol"] not in held:
-            open_short.append(s["symbol"])
-            need_short -= 1
+    long_book, short_book = build("long"), build("short")
+    for s in set(long_book) & set(short_book):              # rare: resolve a both-sides name
+        (short_book if side_val(s, "long") >= side_val(s, "short") else long_book).remove(s)
 
+    keep_long = [s for s in long_book if holdings.get(s) == "long"]
+    open_long = [s for s in long_book if holdings.get(s) != "long"]
+    keep_short = [s for s in short_book if holdings.get(s) == "short"]
+    open_short = [s for s in short_book if holdings.get(s) != "short"]
+    booked = set(long_book) | set(short_book)
+    for s in holdings:                                      # close any held leg not re-kept
+        if s not in booked and s not in close:
+            close.append(s)
     return {"keep_long": keep_long, "keep_short": keep_short,
             "open_long": open_long, "open_short": open_short, "close": close}

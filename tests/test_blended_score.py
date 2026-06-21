@@ -212,6 +212,28 @@ def test_hysteresis_rotates_when_rank_flips_through_the_book():
     assert len(plan["open_long"]) >= 1  # refill the long slot from the top
 
 
+def test_swap_margin_keeps_near_tied_held_legs_compressed_xsection():
+    # compressed cross-section: held long BBB (rank2) and held short EEE (rank4) sit just off the
+    # top-2/bottom-2 but no challenger beats them by the margin -> KEEP (no churn). cy17 shape.
+    scored = _scored([("AAA", 0.30), ("BBB", 0.05), ("CCC", 0.00),
+                      ("DDD", -0.02), ("EEE", -0.05), ("FFF", -0.30)])
+    holdings = {"AAA": "long", "BBB": "long", "EEE": "short", "FFF": "short"}
+    plan = bs.apply_hysteresis(scored, holdings, n_per_side=2, swap_margin=0.5)
+    assert "BBB" in plan["keep_long"] and "EEE" in plan["keep_short"]
+    assert plan["close"] == []                 # nothing churned on near-ties
+
+
+def test_held_short_that_crossed_to_top_is_closed_not_flipped():
+    # a held SHORT bounced to the #1 score (a long-side name) -> CLOSE it; do NOT open it long this
+    # cycle (no same-cycle flip). Its long slot goes to a non-conflicting name. cy17 WLD shape.
+    scored = _scored([("WLD", 0.57), ("LAB", 0.49), ("ZEC", 0.06),
+                      ("BTC", -0.08), ("XRP", -0.30), ("HYPE", -0.55)])
+    holdings = {"WLD": "short", "ZEC": "long", "LAB": "long", "HYPE": "short"}
+    plan = bs.apply_hysteresis(scored, holdings, n_per_side=2, swap_margin=0.5)
+    assert "WLD" in plan["close"]
+    assert "WLD" not in plan["open_long"] and "WLD" not in plan["keep_long"]
+
+
 def test_hysteresis_does_not_churn_on_tiny_margin():
     # a fresh name barely edges a held one -> below swap_margin -> do NOT rotate (min rebalance)
     scored = _scored([("NEW", 1.21), ("AAA", 1.20), ("BBB", 1.0),
