@@ -156,6 +156,36 @@ def select_book(scored: list[dict], n_per_side: int = 3) -> tuple[list[str], lis
     return syms[:n], syms[-n:]
 
 
+def deployment_resizes(holdings: dict[str, str], notional_by_sym: dict[str, float],
+                       equity: float, n_per_side: int, *, band: float = 0.40,
+                       per_trade_risk_pct: float | None = None,
+                       stop_frac_by_sym: dict[str, float] | None = None) -> set[str]:
+    """Held legs whose live notional is MATERIALLY below their reachable per-leg target -> resize.
+
+    The pre-sizer can only SHRINK (risk_mult<=1) and the executor can't grow a held leg in place
+    (no pyramiding — a same-direction re-proposal is "left untouched"), so a book opened piecemeal
+    stays frozen well under the ~1x dollar-neutral target. The only gate-respecting way to grow a
+    leg is to CLOSE it and REOPEN it at target size (cycle.py's explicit-review path treats a
+    re-proposal on a force-closed symbol as a fresh open). The per-leg target is
+    `equity/(2*n_per_side)`, but a WIDE-STOP leg can't reach it: the gate caps each leg at
+    risk_mult=1, i.e. notional <= per_trade_risk_pct*equity/stop_frac. We therefore resize only legs
+    below their REACHABLE target (min of the notional target and that risk ceiling) by more than
+    `band` — so a leg already at its risk ceiling is NOT churned every cycle. Constant-weight
+    rebalancing toward the SAME target (never above it; the gate still owns per-leg risk)."""
+    if equity <= 0 or n_per_side <= 0:
+        return set()
+    target = equity / (2 * n_per_side)
+    out = set()
+    for s in holdings:
+        reachable = target
+        sf = (stop_frac_by_sym or {}).get(s)
+        if per_trade_risk_pct and sf and sf > 0:
+            reachable = min(target, per_trade_risk_pct * equity / sf)   # risk-mult<=1 ceiling
+        if notional_by_sym.get(s, 0.0) < reachable * (1.0 - band):
+            out.add(s)
+    return out
+
+
 def apply_hysteresis(scored: list[dict], holdings: dict[str, str], n_per_side: int = 3,
                      keep_buffer: int = 2, swap_margin: float = 0.5) -> dict:
     """Minimum-rebalance rotation with a SWAP MARGIN (the core anti-churn mechanism).

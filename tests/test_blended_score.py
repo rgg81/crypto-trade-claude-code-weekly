@@ -244,3 +244,44 @@ def test_hysteresis_does_not_churn_on_tiny_margin():
     # AAA still held (NEW only beats it by 0.01 << 0.5 margin)
     assert "AAA" in plan["keep_long"]
     assert "NEW" not in plan["open_long"]
+
+
+# ---- deployment top-up (resize undersized held legs toward ~1x) ----------------
+def test_deployment_resizes_flags_materially_undersized_held_legs():
+    # equity 9750, n_per_side 3 -> per-leg target = 9750/6 = 1625. Held legs at ~755 (0.46x book)
+    # are far below the 0.70x floor (band 0.30) -> all flagged for close+reopen at target.
+    holdings = {"BTCUSDT": "long", "SOLUSDT": "long", "WLDUSDT": "short"}
+    notional = {"BTCUSDT": 1057.0, "SOLUSDT": 446.0, "WLDUSDT": 778.0}
+    out = bs.deployment_resizes(holdings, notional, equity=9750.0, n_per_side=3, band=0.30)
+    assert out == {"BTCUSDT", "SOLUSDT", "WLDUSDT"}
+
+
+def test_deployment_resizes_leaves_near_target_legs_alone():
+    # a leg at 0.95x target is within the band -> NOT resized (no churn near target).
+    holdings = {"BTCUSDT": "long", "UNIUSDT": "short"}
+    target = 9750.0 / 6
+    notional = {"BTCUSDT": target * 0.95, "UNIUSDT": target * 0.60}  # UNI is < 0.70 floor
+    out = bs.deployment_resizes(holdings, notional, equity=9750.0, n_per_side=3, band=0.30)
+    assert out == {"UNIUSDT"}
+
+
+def test_deployment_resizes_empty_when_fully_deployed_or_degenerate():
+    holdings = {"BTCUSDT": "long", "WLDUSDT": "short"}
+    target = 9750.0 / 6
+    at_target = {"BTCUSDT": target, "WLDUSDT": target * 1.2}
+    assert bs.deployment_resizes(holdings, at_target, equity=9750.0, n_per_side=3) == set()
+    # degenerate inputs never resize (no crash)
+    assert bs.deployment_resizes(holdings, at_target, equity=0.0, n_per_side=3) == set()
+    assert bs.deployment_resizes({}, {}, equity=9750.0, n_per_side=3) == set()
+
+
+def test_deployment_resizes_skips_wide_stop_leg_at_its_risk_ceiling():
+    # WLD stop 11% -> risk-mult=1 ceiling = 0.01*9750/0.11 = $886, BELOW the $1625 notional target.
+    # WLD is already ~$880 (maxed), so reopening can't grow it -> must NOT be flagged (no churn).
+    # BTC stop 2.5% -> ceiling $3900 >> target $1625, and it's undersized at $1057 -> DO resize.
+    holdings = {"BTCUSDT": "long", "WLDUSDT": "short"}
+    notional = {"BTCUSDT": 1057.0, "WLDUSDT": 880.0}
+    stop_frac = {"BTCUSDT": 0.025, "WLDUSDT": 0.11}
+    out = bs.deployment_resizes(holdings, notional, equity=9750.0, n_per_side=3, band=0.30,
+                                per_trade_risk_pct=0.01, stop_frac_by_sym=stop_frac)
+    assert out == {"BTCUSDT"}      # WLD at its ceiling is left alone; BTC has room -> resize

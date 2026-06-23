@@ -84,3 +84,36 @@ def test_baseline_run_cycle_still_works(tmp_path):
     report = run_cycle(ex, _settings(), tmp_path / "s", tmp_path / "m",
                        now=datetime(2026, 3, 1, tzinfo=UTC), cycle_no=1)
     assert report["opened"] == 1
+
+def test_resize_same_symbol_close_and_reopen_is_not_left_flat(tmp_path):
+    # DEPLOYMENT TOP-UP mechanism: a held leg is grown by CLOSE+REOPEN in one cycle (held legs can't
+    # pyramid). The explicit-review path (close_absent=False) must treat a re-proposal on a
+    # force-closed symbol as a fresh open -> exactly one FRESH position, never left flat.
+    state_dir, memory_dir = tmp_path / "state", tmp_path / "memory"
+    from futures_fund.memory_layout import ensure_memory_layout
+    from futures_fund.state import load_positions
+    ensure_memory_layout(memory_dir)
+    ex = FakeExchange({"BTC/USDT:USDT": _uptrend()})
+    ctx = fetch_context(ex, _settings())
+    last = float(ctx.frames["BTC/USDT:USDT"]["close"].iloc[-1])
+    account = AccountState(balance=10_000.0, peak_equity=10_000.0)
+
+    def _prop():
+        return TradeProposal(symbol="BTCUSDT", direction="long", entry=last, stop=last - 4.0,
+                             take_profits=[last + 8.0], atr=2.0, confidence=0.7,
+                             horizon_hours=4, funding_rate=0.0)
+
+    execute_proposals(ctx, [_prop()], contributing_agents=["trader"], positions=[],
+                      account=account, state_dir=state_dir, memory_dir=memory_dir,
+                      now=datetime(2026, 3, 1, tzinfo=UTC), cycle_no=1)
+    held = load_positions(state_dir)
+    assert len(held) == 1 and held[0].opened_cycle == 1
+
+    report = execute_proposals(ctx, [_prop()], contributing_agents=["trader"], positions=held,
+                               account=account, state_dir=state_dir, memory_dir=memory_dir,
+                               now=datetime(2026, 3, 1, 5, tzinfo=UTC), cycle_no=2,
+                               close_absent=False, force_close={"BTCUSDT"})
+    after = load_positions(state_dir)
+    assert len(after) == 1, "resize must leave exactly one position — not flat, not doubled"
+    assert after[0].opened_cycle == 2, "the leg must be REOPENED fresh, not the stale held leg"
+    assert report["opened"] == 1 and report["closed"] == 1

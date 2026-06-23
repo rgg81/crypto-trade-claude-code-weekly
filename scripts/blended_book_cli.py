@@ -43,6 +43,9 @@ def main() -> None:
     ap.add_argument("--state", default="state")
     ap.add_argument("--keep-buffer", type=int, default=2)   # stickier book = minimum rebalance
     ap.add_argument("--swap-margin", type=float, default=0.5)
+    # DEPLOYMENT top-up: a kept leg more than this fraction below its per-leg target notional is
+    # CLOSED + REOPENED at target so a frozen-small book fills toward ~1x. 1.0 disables (all hold).
+    ap.add_argument("--resize-band", type=float, default=0.40)
     args = ap.parse_args()
 
     cdir = os.path.join(args.state, "cycle", str(args.cycle))
@@ -58,6 +61,33 @@ def main() -> None:
     weights = scored[0]["weights"] if scored else {}
     plan = bs.apply_hysteresis(scored, holdings, n_per_side=args.n_per_side,
                                keep_buffer=args.keep_buffer, swap_margin=args.swap_margin)
+
+    # DEPLOYMENT TOP-UP: grow frozen-undersized KEPT legs toward the per-leg target (~equity/2 per
+    # side) by CLOSE+REOPEN — held legs can't pyramid, so the only gate-respecting way to enlarge a
+    # leg is to close it and reopen it fresh at target (cycle.py's explicit-review path opens a
+    # re-proposal on a force-closed symbol). The pre-sizer then sizes the reopen to fill the target.
+    equity = float(ctx.get("equity") or 0.0)
+    notional_by_sym, stop_frac_by_sym = {}, {}
+    for p in positions:
+        b = by_sym.get(p["symbol"])
+        if b and b.get("last_close"):
+            notional_by_sym[p["symbol"]] = p["qty"] * float(b["last_close"])
+            if p.get("entry"):
+                stop_frac_by_sym[p["symbol"]] = abs(p["entry"] - p["stop"]) / p["entry"]
+    # per_trade_risk cap for the leg's risk-mult=1 ceiling — book-level regime quadrant (healthy
+    # tier) is a good proxy; the gate still re-clamps each leg by its own regime, this only decides
+    # which legs are worth a resize (skip those already at their wide-stop ceiling -> no churn).
+    quad = (ctx.get("regime_state") or {}).get("quadrant")
+    ptr = {"low_vol_trend": 0.015, "high_vol_trend": 0.010, "low_vol_range": 0.010,
+           "high_vol_range": 0.005, "transition": 0.005}.get(quad, 0.010)
+    kept_now = {s: holdings[s] for s in plan["keep_long"] + plan["keep_short"]}
+    resize = bs.deployment_resizes(kept_now, notional_by_sym, equity, args.n_per_side,
+                                   band=args.resize_band, per_trade_risk_pct=ptr,
+                                   stop_frac_by_sym=stop_frac_by_sym)
+    for sym in resize:                                  # kept-but-undersized -> close + reopen
+        (plan["keep_long"] if holdings[sym] == "long" else plan["keep_short"]).remove(sym)
+        (plan["open_long"] if holdings[sym] == "long" else plan["open_short"]).append(sym)
+        plan["close"].append(sym)
 
     # Build proposals (new opens) + management (close rotated-out, hold kept) + cio allocations.
     score_of = {s["symbol"]: s for s in scored}
@@ -102,9 +132,12 @@ def main() -> None:
 
     for sym in plan["close"]:
         csc = score_of.get(sym, {}).get("score", 0)
-        management.append({"symbol": sym, "action": "close",
-                           "note": f"rotate out — score {csc:+.2f} crossed off the "
-                                   f"{holdings.get(sym, '?')} side."})
+        if sym in resize:
+            note = (f"RESIZE {holdings.get(sym, '?')} — kept by score {csc:+.2f} but undersized; "
+                    f"close+reopen at the per-leg target to fill toward ~1x deployment.")
+        else:
+            note = (f"rotate out — score {csc:+.2f} crossed off the {holdings.get(sym, '?')} side.")
+        management.append({"symbol": sym, "action": "close", "note": note})
 
     n_long = len(plan["keep_long"]) + len(plan["open_long"])
     n_short = len(plan["keep_short"]) + len(plan["open_short"])
@@ -127,6 +160,7 @@ def main() -> None:
         "weights": {k: round(v, 2) for k, v in weights.items()},
         "ranking": [{"sym": s["symbol"], "score": round(s["score"], 2)} for s in scored],
         "plan": plan,
+        "resize": sorted(resize),
         "target_book": {"n_long": n_long, "n_short": n_short,
                         "long": plan["keep_long"] + plan["open_long"],
                         "short": plan["keep_short"] + plan["open_short"]},
