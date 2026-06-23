@@ -61,30 +61,47 @@ def presize_and_balance(props, *, equity, per_trade_risk_pct, held_long=0.0, hel
     # a side with no NEW legs cannot add notional (its target is just its held gross)
     tgt_long_total = max(0.0, side_target - held_long) if longs else 0.0
     tgt_short_total = max(0.0, side_target - held_short) if shorts else 0.0
-    # equal-split per side, then clamp each leg to the per-name cap (N4: no single name dominates)
-    per_long = min(tgt_long_total / len(longs), name_cap) if longs else 0.0
-    per_short = min(tgt_short_total / len(shorts), name_cap) if shorts else 0.0
-
-    # HEAT- and RM-AWARE deployable notional per leg (None heat => heat-blind: legacy, no cap/drop).
-    # Two ceilings the gate will enforce that the equal-split target can EXCEED:
+    # Per-leg DEPLOYMENT CEILING = the per-name cap (N4: no single name dominates) AND, heat-aware,
+    # the two gate clamps the equal-split target can EXCEED:
     #   (1) heat headroom: min(risk_pct, max_heat(regime) - used_heat) — the cy2 starvation case;
     #   (2) per-trade risk_mult clamp to (0,1]: a WIDE-stop leg whose target needs rm>1 is pinned at
     #       rm=1.0, deploying only ptr*equity*entry/|entry-stop| — the cy1 wide-stop-long case.
-    # Cap the target by BOTH so the symmetric trim balances the realized book; else one sleeve
-    # (tight-stop / loose-regime) opens full while the other is clamped, and the book tilts.
-    def _deployable(p, per_side):
-        n = per_side
+    def _ceiling(p):
+        c = name_cap
         if heat_headroom_by_symbol is not None:
-            n = min(n, _heat_notional(p, equity, heat_headroom_by_symbol),
+            c = min(c, _heat_notional(p, equity, heat_headroom_by_symbol),
                     _rm1_notional(p, equity, _ptr(p, per_trade_risk_pct, risk_pct_by_symbol)))
-        return n
+        return c
+
+    # WATER-FILL the side's budget across its legs by those ceilings: a leg pinned at its ceiling
+    # (e.g. a wide-stop leg) has its unused equal-share REDISTRIBUTED to legs that can still absorb
+    # it, so the side fills toward equity/2 instead of equal-splitting and stranding the capped
+    # leg's budget (under-deployment fix: a book sat at ~0.55x because the slack was not reused).
+    def _waterfill(legs, budget):
+        ceils = [_ceiling(p) for p in legs]
+        alloc = [0.0] * len(legs)
+        active = set(range(len(legs)))
+        remaining = max(0.0, budget)
+        while active and remaining > 1e-9:
+            share = remaining / len(active)
+            newly_capped = set()
+            for i in active:
+                give = min(share, ceils[i] - alloc[i])
+                alloc[i] += give
+                remaining -= give
+                if alloc[i] >= ceils[i] - 1e-9:
+                    newly_capped.add(i)
+            if not newly_capped:           # budget spread without hitting a ceiling -> done
+                break
+            active -= newly_capped
+        return list(zip(legs, alloc, strict=True))
 
     def _is_dust(p, n):
         return heat_headroom_by_symbol is not None and n < _dust_notional(p, equity, dust_risk_frac)
 
     heat_dropped: list[str] = []
-    long_legs = [(p, _deployable(p, per_long)) for p in longs]
-    short_legs = [(p, _deployable(p, per_short)) for p in shorts]
+    long_legs = _waterfill(longs, tgt_long_total)
+    short_legs = _waterfill(shorts, tgt_short_total)
     # drop legs the heat ceiling starves below the consolidate dust floor (the gate would size them
     # to dust and consolidate would drop them SILENTLY — surface it here and exclude them upstream)
     def _viable(side_legs):
@@ -125,9 +142,9 @@ def presize_and_balance(props, *, equity, per_trade_risk_pct, held_long=0.0, hel
         gross_long_target = held_long + sum(n for _, n in long_legs)
         gross_short_target = held_short + sum(n for _, n in short_legs)
     else:
-        # heat-blind: per-side targets after the per-name cap (legacy)
-        gross_long_target = held_long + per_long * len(longs)
-        gross_short_target = held_short + per_short * len(shorts)
+        # heat-blind: per-side targets after the per-name cap water-fill (legacy: no symmetric trim)
+        gross_long_target = held_long + sum(n for _, n in long_legs)
+        gross_short_target = held_short + sum(n for _, n in short_legs)
     balanced = min(gross_long_target, gross_short_target)
     summary = {
         "gross_long_target": gross_long_target,

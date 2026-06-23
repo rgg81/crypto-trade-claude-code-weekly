@@ -157,7 +157,7 @@ def select_book(scored: list[dict], n_per_side: int = 3) -> tuple[list[str], lis
 
 
 def deployment_resizes(holdings: dict[str, str], notional_by_sym: dict[str, float],
-                       equity: float, n_per_side: int, *, band: float = 0.40,
+                       equity: float, n_per_side: int, *, band: float = 0.30,
                        per_trade_risk_pct: float | None = None,
                        stop_frac_by_sym: dict[str, float] | None = None) -> set[str]:
     """Held legs whose live notional is MATERIALLY below their reachable per-leg target -> resize.

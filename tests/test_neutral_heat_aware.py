@@ -117,3 +117,28 @@ def test_heat_blind_when_headroom_not_supplied():
         [L, S], equity=_EQ, per_trade_risk_pct=0.01, held_long=0.0, held_short=0.0)
     assert {t.symbol for t in kept} == {"LUSDT", "SUSDT"}
     assert "heat_dropped" not in summary or not summary["heat_dropped"]
+
+
+def test_waterfill_redistributes_capped_leg_budget_to_uncapped_legs():
+    # A WIDE-stop long (rm=1.0 ceiling $500, far below the $1667 equal share) on a side with two
+    # TIGHT-stop longs. The wide leg's stranded ~$1166 of side budget must be REDISTRIBUTED to the
+    # tight legs (water-fill) so the long side fills toward equity/2 -- instead of equal-splitting
+    # and stranding it (the 0.55x under-deployment). Tight shorts let the short side match.
+    wide = _tp("WIDEUSDT", "long", 100.0, 80.0)       # 20% stop -> ceiling 0.01*10000/0.20 = $500
+    tightL1 = _tp("TLA", "long", 100.0, 98.0)          # 2% stop  -> ceiling capped at name_cap
+    tightL2 = _tp("TLB", "long", 100.0, 98.0)
+    shorts = [_tp("TSA", "short", 100.0, 102.0), _tp("TSB", "short", 100.0, 102.0),
+              _tp("TSC", "short", 100.0, 102.0)]
+    ptr_by = {s: 0.01 for s in ["WIDEUSDT", "TLA", "TLB", "TSA", "TSB", "TSC"]}
+    heat_by = {s: 0.10 for s in ptr_by}
+    kept, _ = presize_and_balance(
+        [wide, tightL1, tightL2, *shorts], equity=_EQ, per_trade_risk_pct=0.01,
+        risk_pct_by_symbol=ptr_by, heat_headroom_by_symbol=heat_by)
+    byc = {t.symbol: _notional(t, 0.01) for t in kept}
+    assert byc["WIDEUSDT"] == pytest.approx(500.0, rel=0.05)     # wide pinned at its rm=1 ceiling
+    # each tight long absorbs the stranded budget -> ~$2250, well ABOVE the $1667 equal split
+    assert byc["TLA"] > 2000.0 and byc["TLB"] > 2000.0
+    gl = sum(v for s, v in byc.items() if s in ("WIDEUSDT", "TLA", "TLB"))
+    gs = sum(v for s, v in byc.items() if s in ("TSA", "TSB", "TSC"))
+    assert gl == pytest.approx(gs, rel=0.03)                        # still dollar-neutral
+    assert gl > 4500.0                                             # long side ~filled to equity/2
