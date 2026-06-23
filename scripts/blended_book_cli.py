@@ -44,8 +44,8 @@ def main() -> None:
     ap.add_argument("--keep-buffer", type=int, default=2)   # stickier book = minimum rebalance
     ap.add_argument("--swap-margin", type=float, default=0.5)
     # DEPLOYMENT top-up: a kept leg more than this fraction below its per-leg target notional is
-    # CLOSED + REOPENED at target so a frozen-small book fills toward ~1x. 1.0 disables (all hold).
-    ap.add_argument("--resize-band", type=float, default=0.30)
+    # fraction below the achievable book gross B that triggers a COORDINATED refill. 1.0 disables.
+    ap.add_argument("--resize-band", type=float, default=0.15)
     args = ap.parse_args()
 
     cdir = os.path.join(args.state, "cycle", str(args.cycle))

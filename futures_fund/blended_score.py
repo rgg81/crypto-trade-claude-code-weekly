@@ -156,34 +156,77 @@ def select_book(scored: list[dict], n_per_side: int = 3) -> tuple[list[str], lis
     return syms[:n], syms[-n:]
 
 
+def _leg_ceiling(sym: str, equity: float, per_trade_risk_pct: float | None,
+                 stop_frac_by_sym: dict[str, float] | None, name_cap: float) -> float:
+    """Most notional this leg can deploy: the per-name cap, and (if known) the gate's risk_mult=1
+    clamp = per_trade_risk_pct*equity/stop_frac (a WIDE-stop leg is pinned well below the cap)."""
+    c = name_cap
+    sf = (stop_frac_by_sym or {}).get(sym)
+    if per_trade_risk_pct and sf and sf > 0:
+        c = min(c, per_trade_risk_pct * equity / sf)
+    return c
+
+
+def _waterfill(legs: list[str], budget: float, ceil) -> dict[str, float]:
+    """Distribute `budget` across legs, each capped at ceil(leg); a pinned leg's slack flows to legs
+    that can still absorb it. Mirrors neutral_book.presize_and_balance so `landed` == what the gate
+    would actually deploy."""
+    ceils = {s: ceil(s) for s in legs}
+    alloc = {s: 0.0 for s in legs}
+    active, remaining = set(legs), max(0.0, budget)
+    while active and remaining > 1e-9:
+        share = remaining / len(active)
+        capped = set()
+        for s in list(active):
+            give = min(share, ceils[s] - alloc[s])
+            alloc[s] += give
+            remaining -= give
+            if alloc[s] >= ceils[s] - 1e-9:
+                capped.add(s)
+        if not capped:
+            break
+        active -= capped
+    return alloc
+
+
 def deployment_resizes(holdings: dict[str, str], notional_by_sym: dict[str, float],
-                       equity: float, n_per_side: int, *, band: float = 0.30,
+                       equity: float, n_per_side: int, *, band: float = 0.15,
                        per_trade_risk_pct: float | None = None,
                        stop_frac_by_sym: dict[str, float] | None = None) -> set[str]:
-    """Held legs whose live notional is MATERIALLY below their reachable per-leg target -> resize.
+    """COORDINATED deployment top-up: which held legs to CLOSE+REOPEN to grow a frozen book to ~1x.
 
-    The pre-sizer can only SHRINK (risk_mult<=1) and the executor can't grow a held leg in place
-    (no pyramiding — a same-direction re-proposal is "left untouched"), so a book opened piecemeal
-    stays frozen well under the ~1x dollar-neutral target. The only gate-respecting way to grow a
-    leg is to CLOSE it and REOPEN it at target size (cycle.py's explicit-review path treats a
-    re-proposal on a force-closed symbol as a fresh open). The per-leg target is
-    `equity/(2*n_per_side)`, but a WIDE-STOP leg can't reach it: the gate caps each leg at
-    risk_mult=1, i.e. notional <= per_trade_risk_pct*equity/stop_frac. We therefore resize only legs
-    below their REACHABLE target (min of the notional target and that risk ceiling) by more than
-    `band` — so a leg already at its risk ceiling is NOT churned every cycle. Constant-weight
-    rebalancing toward the SAME target (never above it; the gate still owns per-leg risk)."""
-    if equity <= 0 or n_per_side <= 0:
+    Held legs can't pyramid (a same-direction re-proposal is "left untouched") and the pre-sizer
+    only SHRINKS, so a piecemeal-opened book stays frozen below target; the only gate-respecting way
+    to grow a leg is close+reopen (cycle.py's explicit-review path opens a re-proposal on a
+    force-closed symbol). But resizing ONE leg can't grow a dollar-neutral book — the balancer pins
+    each side to the smaller, so a leg on the under-deployed side just reopens at the same
+    balance-capped size and CHURNS. So this is book-level and all-or-nothing:
+
+      B (achievable gross/side) = min(equity/2, each side's ceiling-sum); `landed` = water-fill B
+      across each side (== what the gate deploys). If the SMALLER side's live gross is within `band`
+      of B the book is already as full as its risk geometry allows -> resize NOTHING (no churn).
+      Otherwise the book is materially under-deployed -> resize EVERY leg below its landed size, on
+      BOTH sides, so they reopen together and the pre-sizer fills both sides to B.
+
+    A wide-stop leg already at its ceiling has landed == its notional, so it is never flagged."""
+    if equity <= 0 or n_per_side <= 0 or not holdings:
         return set()
-    target = equity / (2 * n_per_side)
-    out = set()
-    for s in holdings:
-        reachable = target
-        sf = (stop_frac_by_sym or {}).get(s)
-        if per_trade_risk_pct and sf and sf > 0:
-            reachable = min(target, per_trade_risk_pct * equity / sf)   # risk-mult<=1 ceiling
-        if notional_by_sym.get(s, 0.0) < reachable * (1.0 - band):
-            out.add(s)
-    return out
+    name_cap = 0.25 * equity
+    def _ceil(s):
+        return _leg_ceiling(s, equity, per_trade_risk_pct, stop_frac_by_sym, name_cap)
+    sides = {d: [s for s in holdings if holdings[s] == d] for d in ("long", "short")}
+    present = [sum(_ceil(s) for s in legs) for legs in sides.values() if legs]
+    book = min([equity / 2.0, *present]) if present else 0.0
+    if book <= 0:
+        return set()
+    landed = {}
+    for legs in sides.values():
+        landed.update(_waterfill(legs, book, _ceil))
+    deployed = min(sum(notional_by_sym.get(s, 0.0) for s in legs)
+                   for legs in sides.values() if legs)
+    if deployed >= book * (1.0 - band):
+        return set()                              # already near the achievable book -> no churn
+    return {s for s in holdings if notional_by_sym.get(s, 0.0) < landed.get(s, 0.0) * 0.90}
 
 
 def apply_hysteresis(scored: list[dict], holdings: dict[str, str], n_per_side: int = 3,
