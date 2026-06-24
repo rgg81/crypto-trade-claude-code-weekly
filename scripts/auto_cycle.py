@@ -84,9 +84,10 @@ def main() -> int:
     upath = os.path.join(cdir, "universe.json")
     if not os.path.exists(upath):
         longs, shorts = _book()
+        book = f"LONG {'/'.join(longs)} vs SHORT {'/'.join(shorts)}"
         print(f"HOLD-ON-DATA-OUTAGE cycle {cycle}: scout produced no universe (Binance "
-              f"rate-limit/network) — book held, retry next tick. "
-              f"LONG {'/'.join(longs)} vs SHORT {'/'.join(shorts)} | err: {sc.stderr.strip()[-160:]}")
+              f"rate-limit/network) — book held, retry next tick. {book} | "
+              f"err: {sc.stderr.strip()[-160:]}")
         return 0
     uni = json.load(open(upath))
     uni_syms = [s["symbol"] for s in uni.get("universe", uni.get("candidates", []))]
