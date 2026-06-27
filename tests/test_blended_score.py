@@ -288,3 +288,33 @@ def test_deployment_resizes_skips_wide_stop_leg_at_ceiling_during_refill():
                                 per_trade_risk_pct=0.01, stop_frac_by_sym=stop)
     assert "WLDUSDT" not in out                    # at its ceiling -> can't grow -> left alone
     assert out == {"BTCUSDT", "SOLUSDT", "UNIUSDT"}      # legs with room refill together
+
+
+# ---- make room for a net-added leg (fix the persistent L2/S3 dust-drop) ----------
+def test_make_room_for_adds_resizes_kept_legs_when_a_side_gains_a_leg():
+    # L2/S3 refill: the long side gains HYPE (open, no matching close). The 2 kept longs already
+    # fill the side, so HYPE sizes net-of-held -> dust. They must close+reopen so all 3 re-fill.
+    plan = {"keep_long": ["LAB", "SOL"], "keep_short": ["WLD", "ZEC", "XRP"],
+            "open_long": ["HYPE"], "open_short": [], "close": []}
+    holdings = {"LAB": "long", "SOL": "long", "WLD": "short", "ZEC": "short", "XRP": "short"}
+    extra = bs.make_room_for_adds(plan, holdings)
+    assert extra == {"LAB", "SOL"}
+    assert set(plan["open_long"]) == {"HYPE", "LAB", "SOL"}   # all 3 longs (re)open -> water-fill
+    assert set(plan["close"]) == {"LAB", "SOL"}               # kept longs close to reopen
+    assert plan["keep_long"] == []
+    assert plan["keep_short"] == ["WLD", "ZEC", "XRP"]        # short side untouched (no net add)
+
+
+def test_make_room_for_adds_noop_on_one_for_one_rotation_and_hold():
+    # a 1-for-1 rotation (close A long, open B long) has opens==closes on the side -> B takes A's
+    # freed slot, no need to disturb the other kept legs.
+    plan = {"keep_long": ["LAB", "SOL"], "keep_short": ["WLD", "ZEC", "XRP"],
+            "open_long": ["BNB"], "open_short": [], "close": ["AAVE"]}
+    holdings = {"LAB": "long", "SOL": "long", "AAVE": "long",
+                "WLD": "short", "ZEC": "short", "XRP": "short"}
+    assert bs.make_room_for_adds(plan, holdings) == set()
+    assert plan["keep_long"] == ["LAB", "SOL"]
+    # a pure HOLD (no opens) never resizes
+    hold = {"keep_long": ["LAB", "SOL"], "keep_short": ["WLD", "ZEC"],
+            "open_long": [], "open_short": [], "close": []}
+    assert bs.make_room_for_adds(hold, {}) == set()

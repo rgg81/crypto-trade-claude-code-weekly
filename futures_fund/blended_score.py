@@ -229,6 +229,28 @@ def deployment_resizes(holdings: dict[str, str], notional_by_sym: dict[str, floa
     return {s for s in holdings if notional_by_sym.get(s, 0.0) < landed.get(s, 0.0) * 0.90}
 
 
+def make_room_for_adds(plan: dict, holdings: dict[str, str]) -> set[str]:
+    """Make room when a side gains a NET-new leg (more opens than closes there).
+
+    The pre-sizer sizes a new open net-of-held, so if the kept legs already fill the side the new
+    leg sizes to ~0 and is dust-dropped — the book gets stuck count-imbalanced (the persistent
+    L2/S3 dust-drop: the builder proposes a 3rd long every cycle, it dusts, the guard trims the
+    other side, repeat). A 1-for-1 rotation is fine (the replacement takes the closed leg's freed
+    slot), but a net add needs the WHOLE side to re-water-fill. So for any side with more opens than
+    closes, move its kept legs to close+reopen so all the side's legs share it. Mutates `plan` in
+    place and returns the kept symbols newly marked for resize (for the management note)."""
+    extra = set()
+    for d in ("long", "short"):
+        n_close_here = sum(1 for s in plan["close"] if holdings.get(s) == d)
+        if len(plan[f"open_{d}"]) > n_close_here:
+            for s in list(plan[f"keep_{d}"]):
+                plan[f"keep_{d}"].remove(s)
+                plan[f"open_{d}"].append(s)
+                plan["close"].append(s)
+                extra.add(s)
+    return extra
+
+
 def apply_hysteresis(scored: list[dict], holdings: dict[str, str], n_per_side: int = 3,
                      keep_buffer: int = 2, swap_margin: float = 0.5) -> dict:
     """Minimum-rebalance rotation with a SWAP MARGIN (the core anti-churn mechanism).
