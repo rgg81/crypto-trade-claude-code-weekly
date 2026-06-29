@@ -43,9 +43,10 @@ def main() -> None:
     ap.add_argument("--state", default="state")
     ap.add_argument("--keep-buffer", type=int, default=2)   # stickier book = minimum rebalance
     ap.add_argument("--swap-margin", type=float, default=0.5)
-    # DEPLOYMENT top-up: a kept leg more than this fraction below its per-leg target notional is
-    # fraction below the achievable book gross B that triggers a COORDINATED refill. 1.0 disables.
-    ap.add_argument("--resize-band", type=float, default=0.15)
+    # DEPLOYMENT refill trigger: fire only when the smaller side's gross is more than this fraction
+    # below the achievable book B. 0.30 leaves room below the heat-capped max (~0.80xB) so normal
+    # price drift doesn't trip a full re-water-fill every cycle (B ignores heat, so 0.85 churned).
+    ap.add_argument("--resize-band", type=float, default=0.30)
     args = ap.parse_args()
 
     cdir = os.path.join(args.state, "cycle", str(args.cycle))

@@ -190,7 +190,7 @@ def _waterfill(legs: list[str], budget: float, ceil) -> dict[str, float]:
 
 
 def deployment_resizes(holdings: dict[str, str], notional_by_sym: dict[str, float],
-                       equity: float, n_per_side: int, *, band: float = 0.15,
+                       equity: float, n_per_side: int, *, band: float = 0.30,
                        per_trade_risk_pct: float | None = None,
                        stop_frac_by_sym: dict[str, float] | None = None) -> set[str]:
     """COORDINATED deployment top-up: which held legs to CLOSE+REOPEN to grow a frozen book to ~1x.
