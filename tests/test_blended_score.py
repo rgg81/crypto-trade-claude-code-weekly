@@ -290,31 +290,48 @@ def test_deployment_resizes_skips_wide_stop_leg_at_ceiling_during_refill():
     assert out == {"BTCUSDT", "SOLUSDT", "UNIUSDT"}      # legs with room refill together
 
 
-# ---- make room for a net-added leg (fix the persistent L2/S3 dust-drop) ----------
-def test_make_room_for_adds_resizes_kept_legs_when_a_side_gains_a_leg():
-    # L2/S3 refill: the long side gains HYPE (open, no matching close). The 2 kept longs already
-    # fill the side, so HYPE sizes net-of-held -> dust. They must close+reopen so all 3 re-fill.
+# ---- make room for a STARVED new leg (fix the recurring L2/S3 dust-drop) ----------
+_EQ = 10_000.0    # fair share = 10000/(2*3) = $1667; starve floor (0.5x) = $833
+
+
+def test_make_room_resizes_kept_legs_for_a_starved_net_add():
+    # L2/S3 refill: long gains HYPE (open, no close). Kept LAB+SOL ($3000) fill the balanced budget
+    # (short gross $3500), so HYPE share = (3500-3000)/1 = $500 < $833 -> starved -> resize.
     plan = {"keep_long": ["LAB", "SOL"], "keep_short": ["WLD", "ZEC", "XRP"],
             "open_long": ["HYPE"], "open_short": [], "close": []}
     holdings = {"LAB": "long", "SOL": "long", "WLD": "short", "ZEC": "short", "XRP": "short"}
-    extra = bs.make_room_for_adds(plan, holdings)
+    notional = {"LAB": 1500, "SOL": 1500, "WLD": 1167, "ZEC": 1167, "XRP": 1166}
+    extra = bs.make_room_for_adds(plan, holdings, notional, _EQ, 3)
     assert extra == {"LAB", "SOL"}
-    assert set(plan["open_long"]) == {"HYPE", "LAB", "SOL"}   # all 3 longs (re)open -> water-fill
-    assert set(plan["close"]) == {"LAB", "SOL"}               # kept longs close to reopen
-    assert plan["keep_long"] == []
-    assert plan["keep_short"] == ["WLD", "ZEC", "XRP"]        # short side untouched (no net add)
+    assert set(plan["open_long"]) == {"HYPE", "LAB", "SOL"} and plan["keep_long"] == []
+    assert plan["keep_short"] == ["WLD", "ZEC", "XRP"]        # short side fine, untouched
 
 
-def test_make_room_for_adds_noop_on_one_for_one_rotation_and_hold():
-    # a 1-for-1 rotation (close A long, open B long) has opens==closes on the side -> B takes A's
-    # freed slot, no need to disturb the other kept legs.
+def test_make_room_resizes_for_a_starved_one_for_one_rotation():
+    # cy59 BNB shape: 1-for-1 rotation (close LAB, open BNB) but kept AAVE+SOL ($3000) nearly fill
+    # the balanced budget (short $3500) -> BNB share = (3500-3000)/1 = $500 < $833 -> starved ->
+    # resize AAVE+SOL so BNB gets its fair ~1/3. (The old opens>closes rule missed this 1-for-1.)
+    plan = {"keep_long": ["AAVE", "SOL"], "keep_short": ["WLD", "ZEC", "XRP"],
+            "open_long": ["BNB"], "open_short": [], "close": ["LAB"]}
+    holdings = {"AAVE": "long", "SOL": "long", "LAB": "long",
+                "WLD": "short", "ZEC": "short", "XRP": "short"}
+    notional = {"AAVE": 1500, "SOL": 1500, "LAB": 500, "WLD": 1167, "ZEC": 1167, "XRP": 1166}
+    extra = bs.make_room_for_adds(plan, holdings, notional, _EQ, 3)
+    assert extra == {"AAVE", "SOL"}
+    assert set(plan["open_long"]) == {"BNB", "AAVE", "SOL"}
+
+
+def test_make_room_leaves_a_well_fed_rotation_and_hold_alone():
+    # a rotation whose replacement gets a FAIR share must NOT churn the kept legs (no thrash amp).
+    # kept LAB+SOL are small ($800), short gross $3500 -> BNB share (3500-800)/1 = $2700 >> $833.
     plan = {"keep_long": ["LAB", "SOL"], "keep_short": ["WLD", "ZEC", "XRP"],
             "open_long": ["BNB"], "open_short": [], "close": ["AAVE"]}
     holdings = {"LAB": "long", "SOL": "long", "AAVE": "long",
                 "WLD": "short", "ZEC": "short", "XRP": "short"}
-    assert bs.make_room_for_adds(plan, holdings) == set()
+    notional = {"LAB": 400, "SOL": 400, "AAVE": 1500, "WLD": 1167, "ZEC": 1167, "XRP": 1166}
+    assert bs.make_room_for_adds(plan, holdings, notional, _EQ, 3) == set()
     assert plan["keep_long"] == ["LAB", "SOL"]
     # a pure HOLD (no opens) never resizes
     hold = {"keep_long": ["LAB", "SOL"], "keep_short": ["WLD", "ZEC"],
             "open_long": [], "open_short": [], "close": []}
-    assert bs.make_room_for_adds(hold, {}) == set()
+    assert bs.make_room_for_adds(hold, {}, {"LAB": 1}, _EQ, 3) == set()

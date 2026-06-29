@@ -89,9 +89,10 @@ def main() -> None:
         (plan["open_long"] if holdings[sym] == "long" else plan["open_short"]).append(sym)
         plan["close"].append(sym)
 
-    # MAKE ROOM: a side gaining a net-new leg must re-water-fill (else the new leg dust-drops -> the
-    # persistent L2/S3). Close+reopen the kept legs on that side so all its legs share the budget.
-    resize |= bs.make_room_for_adds(plan, holdings)
+    # MAKE ROOM: if a side's new leg would be STARVED (kept legs nearly fill the balanced budget) it
+    # dust-drops -> the recurring L2/S3. Re-water-fill that side (close+reopen its kept legs) so the
+    # new leg gets its fair share. A well-fed rotation is left alone (no thrash amplification).
+    resize |= bs.make_room_for_adds(plan, holdings, notional_by_sym, equity, args.n_per_side)
 
     # Build proposals (new opens) + management (close rotated-out, hold kept) + cio allocations.
     score_of = {s["symbol"]: s for s in scored}
