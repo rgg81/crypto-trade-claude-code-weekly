@@ -215,6 +215,14 @@ def deployment_resizes(holdings: dict[str, str], notional_by_sym: dict[str, floa
     def _ceil(s):
         return _leg_ceiling(s, equity, per_trade_risk_pct, stop_frac_by_sym, name_cap)
     sides = {d: [s for s in holdings if holdings[s] == d] for d in ("long", "short")}
+    # MID-ROTATION GUARD: only judge deployment on a FULL book (both sides at n_per_side legs). On a
+    # rotation cycle the caller passes just the KEPT legs, so a side is short a slot the rotation-in
+    # will fill THIS cycle; a partial side computes landed = B/kept-count (over-large) and deployed
+    # as a kept-only sum, so legs already at their true B/n_per_side share look under-deployed and a
+    # full-book resize misfires (the rot-12 rotation cycles). Defer: the rotation-in + make_room
+    # deploy this cycle; a later HOLD cycle refills residual drift with the full-book landed.
+    if any(len(sides[d]) != n_per_side for d in ("long", "short")):
+        return set()
     present = [sum(_ceil(s) for s in legs) for legs in sides.values() if legs]
     book = min([equity / 2.0, *present]) if present else 0.0
     if book <= 0:

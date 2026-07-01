@@ -290,6 +290,20 @@ def test_deployment_resizes_skips_wide_stop_leg_at_ceiling_during_refill():
     assert out == {"BTCUSDT", "SOLUSDT", "UNIUSDT"}      # legs with room refill together
 
 
+def test_deployment_resizes_ignores_a_partial_mid_rotation_side():
+    # cy65 REGRESSION: on a rotation cycle the CLI passes only the KEPT legs (2/side, the
+    # rotation-in is not held yet), so a side has fewer than n_per_side legs. Those kept legs
+    # sit at their correct FULL-book share (~B/3 = $1625), but judging a 2-leg partial as if it were
+    # the whole side computes landed = B/2 and deployed = 2-leg-sum, so every leg looks
+    # under-deployed and a full-book resize misfires (the rot-12 rotation cycles). A side below
+    # n_per_side means the book is MID-ROTATION: the rotation-in + make_room fill the empty slot
+    # cycle, and a later HOLD cycle refills any residual drift. Defer -> resize NOTHING.
+    holdings = {"BTCUSDT": "long", "SOLUSDT": "long", "WLDUSDT": "short", "UNIUSDT": "short"}
+    notional = {k: 1600.0 for k in holdings}          # ~B/3, correct for the real 3-leg book
+    out = bs.deployment_resizes(holdings, notional, equity=9750.0, n_per_side=3, band=0.30)
+    assert out == set()
+
+
 # ---- make room for a STARVED new leg (fix the recurring L2/S3 dust-drop) ----------
 _EQ = 10_000.0    # fair share = 10000/(2*3) = $1667; starve floor (0.5x) = $833
 
