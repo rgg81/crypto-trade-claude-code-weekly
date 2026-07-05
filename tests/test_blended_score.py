@@ -349,3 +349,20 @@ def test_make_room_leaves_a_well_fed_rotation_and_hold_alone():
     hold = {"keep_long": ["LAB", "SOL"], "keep_short": ["WLD", "ZEC"],
             "open_long": [], "open_short": [], "close": []}
     assert bs.make_room_for_adds(hold, {}, {"LAB": 1}, _EQ, 3) == set()
+
+
+def test_make_room_leaves_a_balanced_double_rotation_alone():
+    # cy91 REGRESSION: BOTH sides rotate 1-for-1 in one cycle (long ZEC->ETH, short BTC->DOGE).
+    # Every leg is at its fair ~1/3 share ($1667) of a full ~1x book. The new legs are NOT starved:
+    # each side's incoming leg is balanced by the OTHER side's incoming leg, so both sides still
+    # deploy ~equity/2. But judging a side's balanced budget from only the opposite side's SURVIVING
+    # held gross (2 legs = ~equity/3, ignoring its rotation-in) makes both new legs look starved ->
+    # both sides needlessly re-water-fill -> the rot-12 double-rotation churn. Count the opposite
+    # side's incoming open -> NOT starved -> resize NOTHING (just the 2 real rotations).
+    plan = {"keep_long": ["ADA", "HYPE"], "keep_short": ["SOL", "BNB"],
+            "open_long": ["ETH"], "open_short": ["DOGE"], "close": ["ZEC", "BTC"]}
+    holdings = {"ADA": "long", "HYPE": "long", "ZEC": "long",
+                "SOL": "short", "BNB": "short", "BTC": "short"}
+    notional = {k: 1667.0 for k in holdings}          # full ~1x book, every leg at fair 1/3
+    assert bs.make_room_for_adds(plan, holdings, notional, _EQ, 3) == set()
+    assert plan["keep_long"] == ["ADA", "HYPE"] and plan["keep_short"] == ["SOL", "BNB"]

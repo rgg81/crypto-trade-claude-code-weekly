@@ -275,7 +275,13 @@ def make_room_for_adds(plan: dict, holdings: dict[str, str],
         if not opens or not kept:
             continue
         opp = "short" if d == "long" else "long"
-        balanced = min(equity / 2.0, held_gross[opp])           # neutrality caps side at opp gross
+        # Neutrality caps this side at the opposite side's gross. Count the opposite side's INCOMING
+        # opens at their fair share, not just its surviving held legs: on a double-rotation the
+        # opposite side is also mid-rotation (a leg out, a leg in), and using only its 2 surviving
+        # legs understates its gross to ~equity/3 -> both new legs look starved -> both sides
+        # needlessly re-water-fill (the rot-12 double-rotation churn). Its rotation-in restores it.
+        opp_gross = held_gross[opp] + len(plan[f"open_{opp}"]) * fair
+        balanced = min(equity / 2.0, opp_gross)
         kept_gross = sum(notional_by_sym.get(s, 0.0) for s in kept)
         per_open = (balanced - kept_gross) / len(opens)
         if per_open < starve_frac * fair:                       # new leg(s) would be starved
