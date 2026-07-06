@@ -24,7 +24,10 @@ import math
 from statistics import pstdev
 
 # Tradeability floors (exclude untradeable pumps / illiquid microcaps / data artifacts).
-MIN_OI_USD = 50e6          # below this notional OI a name is an illiquid microcap -> NO-TOUCH
+MIN_OI_USD = 75e6          # below this notional OI a name is too thin -> NO-TOUCH.
+# Raised 50e6->75e6 (LAB tax): a ~$55-60M name is liquid enough to pass but too thin to size to a
+# fair share (its wide stop clamps it small), so it under-deploys its sleeve, forces a neutrality
+# guard-trim, and whipsaws in/out (cy84-91).
 PUMP_MOM = 0.30            # +30% over 20 bars ...
 PUMP_RSI = 72.0           # ... with RSI > 72 = a parabolic blow-off -> NO-TOUCH
 # |20-bar move| >= 50% is parabolic/degenerate REGARDLESS of RSI -> NO-TOUCH. (RSI mean-reverts

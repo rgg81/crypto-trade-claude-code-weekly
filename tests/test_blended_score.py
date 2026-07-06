@@ -65,6 +65,16 @@ def test_is_tradeable_excludes_illiquid_microcap():
     assert not bs.is_tradeable(tiny)
 
 
+def test_is_tradeable_excludes_thin_midcap_at_raised_oi_floor():
+    # LAB-shape: passed the OLD $50M floor but THIN (~$60M) + volatile -> it clamps to a small
+    # notional (wide stop), under-deploys its sleeve (forcing a neutrality guard-trim) and whipsaws
+    # in/out (cy84-91 tax, ~1.4% turnover per one-cycle cameo). Floor raised to $75M so thin names
+    # are excluded from the universe; a comfortably-liquid name stays in.
+    thin = _brief("LABUSDT", mom=0.12, rsi=55, oi=60e6)   # normal mom/rsi, not a pump -- just thin
+    assert not bs.is_tradeable(thin)
+    assert bs.is_tradeable(_brief("SOLUSDT", mom=0.10, rsi=52, oi=800e6))
+
+
 def test_is_tradeable_excludes_nan_atr_artifact():
     art = _brief("REUSDT", atr=float("nan"), oi=7e6)
     assert not bs.is_tradeable(art)
