@@ -11,6 +11,7 @@ from datetime import UTC
 
 import pytest
 
+from futures_fund import orchestration
 from futures_fund.consolidation import consolidate
 from futures_fund.contracts import AgentProposal
 from futures_fund.models import CostEstimate, SizedTrade, TradeProposal
@@ -46,6 +47,35 @@ def test_presizer_sizes_leg_to_half_equity_and_book_is_about_1x(tmp_path):
     assert pos.leverage == pytest.approx(1.0)             # literal 1x per position (full margin)
     # the gate also reports a neutrality check (one-sided here -> flagged via balanced_gross 0)
     assert "neutral_check" in report
+
+
+# ---- T3: a pre-sizer exception is SURFACED, never silently swallowed --------------------------
+
+def test_presize_exception_is_recorded_not_swallowed(tmp_path, monkeypatch):
+    """HARD RULE 8: if the dollar-neutral pre-sizer raises, the gate must still open the book
+    (fail-safe) BUT record the error so the operator/next cycle can see it — a swallowed exception
+    that silently disables balancing (leaving the book count-imbalanced) must never be invisible."""
+    state_dir, memory_dir = tmp_path / "s", tmp_path / "m"
+    ex = FakeExchange({"BTC/USDT:USDT": _uptrend()})
+    pf = preflight_step(ex, _settings(), state_dir, memory_dir,
+                        now=dt.datetime(2026, 3, 1, tzinfo=UTC), cycle_no=1,
+                        http_client=_HttpClient())
+
+    def _boom(*a, **k):
+        raise RuntimeError("presize kaboom")
+
+    monkeypatch.setattr(orchestration, "presize_and_balance", _boom)
+    last = pf["briefs"][0]["last_close"]
+    proposals = [AgentProposal(symbol="BTCUSDT", direction="long", entry=last, stop=last - 4.0,
+                               take_profits=[last + 8.0, last + 12.0], atr=2.0, confidence=0.7,
+                               rationale="momentum long").model_dump()]
+    report = gate_execute_step(ex, _settings(), state_dir, memory_dir, proposals=proposals,
+                               now=dt.datetime(2026, 3, 1, tzinfo=UTC), cycle_no=1)
+    # fail-safe still ran the gate (book opened despite the presize error)
+    assert report["opened"] == 1
+    # the error is SURFACED, not swallowed into a bare None
+    assert report["neutral_check"]["presize_error"] is not None
+    assert "presize kaboom" in report["neutral_check"]["presize_error"]
 
 
 # ---- T2: net~=0 survives consolidate() heat scaling -------------------------------------------

@@ -14,6 +14,7 @@ import json
 import os
 import subprocess
 import sys
+from datetime import datetime
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PY = [sys.executable]
@@ -56,6 +57,56 @@ def _gate_exposure(cycle: int):
         return None
 
 
+def _check_monthly_review() -> bool:
+    """Check if monthly review is needed (>30 days since last run).
+
+    Returns True if review was run, False otherwise.
+    """
+    review_dir = os.path.join(ROOT, "state", "monthly_review")
+    if not os.path.exists(review_dir):
+        os.makedirs(review_dir, exist_ok=True)
+
+    # Find the most recent review file
+    reviews = []
+    for f in os.listdir(review_dir):
+        if f.endswith(".json") and f.count("-") == 1:  # YYYY-MM.json format
+            try:
+                year, month = map(int, f[:-5].split("-"))
+                reviews.append(datetime(year, month, 1))
+            except (ValueError, IndexError):
+                continue
+
+    if not reviews:
+        # No review yet - run one
+        last_review = None
+    else:
+        last_review = max(reviews)
+
+    now = datetime.now()
+    days_since_review = (now - last_review).days if last_review else 999
+
+    if days_since_review >= 30:
+        # Time to run monthly review
+        print(f"\n[MONTHLY REVIEW] Running - last review {days_since_review} days ago...")
+        mr = run(["scripts/monthly_review.py", "--days", "60"])
+
+        # Print just the summary lines
+        lines = mr.stdout.strip().split("\n")
+        in_summary = False
+        for line in lines:
+            if "RECOMMENDATIONS" in line:
+                in_summary = True
+            if in_summary or "Performance:" in line or "Churn:" in line or "Neutrality:" in line:
+                print(f"  {line}")
+
+        if mr.returncode != 0:
+            print(f"  Review error: {mr.stderr.strip()[-200:]}")
+
+        return True
+
+    return False
+
+
 def main() -> int:
     rl = run(["scripts/run_loops.py"])
     try:
@@ -72,6 +123,10 @@ def main() -> int:
         flat = not longs or not shorts
         print(f"SKIP cycle {cycle} | {'FLAT!' if flat else 'deployed'} | "
               f"LONG {'/'.join(longs)} vs SHORT {'/'.join(shorts)}")
+
+        # Monthly review check (optional, runs every ~30 days)
+        _check_monthly_review()
+
         return 0
 
     cdir = os.path.join(ROOT, "state", "cycle", str(cycle))
@@ -158,6 +213,10 @@ def main() -> int:
     flat = not longs or not shorts
     print(f"SUMMARY cycle {cycle} | {'FLAT! (VIOLATION)' if flat else 'deployed'} | "
           f"LONG {'/'.join(longs)} vs SHORT {'/'.join(shorts)} | equity {rep['equity']:.2f}")
+
+    # Monthly review check (optional, runs every ~30 days)
+    _check_monthly_review()
+
     return 0
 
 

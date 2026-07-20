@@ -916,6 +916,7 @@ def gate_execute_step(exchange, settings: Settings, state_dir, memory_dir,
     # so the notional target is exact, and net held long/short notional into the per-side targets.
     # FAIL-SAFE: any error leaves trade_props untouched (gate still sizes them, just unbalanced).
     neutral_summary = None
+    presize_error = None
     if trade_props:
         try:
             from futures_fund.baseline import simple_regime
@@ -952,8 +953,12 @@ def gate_execute_step(exchange, settings: Settings, state_dir, memory_dir,
                 trade_props, equity=_nh.equity, per_trade_risk_pct=_ncaps.per_trade_risk_pct,
                 held_long=_nexp.get("gross_long", 0.0), held_short=_nexp.get("gross_short", 0.0),
                 risk_pct_by_symbol=_ptr_by_sym, heat_headroom_by_symbol=_heat_by_sym)
-        except Exception:  # noqa: BLE001 — neutral pre-size is advisory sizing; never break the gate
+        except Exception as _pe:  # noqa: BLE001 — advisory sizing; never break the gate, but SURFACE
+            # HARD RULE 8: a swallowed pre-size failure silently disables dollar-balancing (the book
+            # runs unbalanced / count-imbalanced with no signal). Record the cause so the operator
+            # and the NEXT cycle can see WHY balancing stopped instead of a mute None.
             neutral_summary = None
+            presize_error = (str(_pe).replace("\n", " ") if str(_pe) else type(_pe).__name__)[:200]
     # loop-aware attribution: the fast loop's opens come from the Scalper; the strategic loop's from
     # the CIO+Trader. (Per-desk attribution for strategic opens is added when the CIO output is
     # wired.)
@@ -1066,6 +1071,7 @@ def gate_execute_step(exchange, settings: Settings, state_dir, memory_dir,
         report["neutral_check"] = {
             "tilt": _tilt, "balanced": _tilt <= 0.30,
             "presize": neutral_summary,
+            "presize_error": presize_error,   # non-None => pre-sizer raised (balancing disabled)
         }
     except Exception:  # noqa: BLE001 — telemetry must never break the gate
         pass
