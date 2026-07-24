@@ -12,12 +12,57 @@ Exit codes: 0 ok (ran or skipped), 1 error.
 """
 import json
 import os
+import re
 import subprocess
 import sys
+import time
 from datetime import datetime
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PY = [sys.executable]
+
+# Binance -1003 IP-ban message carries a `banned until <epoch_ms>` deadline. Every REST fetch made
+# while the ban is active re-extends it ~22min, so we persist the deadline and HOLD before touching
+# the exchange until it lapses (else the ban ratchets ahead of real time — observed cy190).
+_BAN_RE = re.compile(r"banned until (\d{10,})")
+
+
+def _parse_ban_until_ms(text: str) -> int | None:
+    """Extract the `banned until <epoch_ms>` deadline from a -1003 message, or None if absent."""
+    m = _BAN_RE.search(text or "")
+    return int(m.group(1)) if m else None
+
+
+def _ban_path(state_dir) -> str:
+    return os.path.join(str(state_dir), "ban.json")
+
+
+def _record_ban(state_dir, banned_until_ms: int) -> None:
+    """Persist the ban deadline, keeping the LATEST (max) — a later ban extends, an earlier never
+    shortens. Best-effort: a write failure must never break the hold path."""
+    try:
+        prev = 0
+        p = _ban_path(state_dir)
+        if os.path.exists(p):
+            prev = int(json.load(open(p)).get("banned_until_ms", 0))
+        deadline = max(prev, int(banned_until_ms))
+        json.dump({"banned_until_ms": deadline}, open(p, "w"))
+    except Exception:  # noqa: BLE001 — telemetry only; never break the driver
+        pass
+
+
+def _ban_remaining_ms(state_dir, now_ms: int | None = None) -> int:
+    """Milliseconds until the recorded ban lapses (0 if none / already lapsed -> safe to fetch)."""
+    p = _ban_path(state_dir)
+    if not os.path.exists(p):
+        return 0
+    try:
+        deadline = int(json.load(open(p)).get("banned_until_ms", 0))
+    except Exception:  # noqa: BLE001
+        return 0
+    if now_ms is None:
+        now_ms = int(time.time() * 1000)
+    return max(0, deadline - now_ms)
 
 
 def run(args, **kw):
@@ -132,16 +177,35 @@ def main() -> int:
     cdir = os.path.join(ROOT, "state", "cycle", str(cycle))
     print(f"DUE cycle {cycle}: running deterministic blended tick")
 
+    # BAN GUARD (self-heal): if a prior fire recorded an ACTIVE -1003 IP ban, HOLD before touching
+    # the exchange — any fetch now would only re-extend the ban ~22min and it would never lapse
+    # (observed cy190: the ban ratcheted ahead of real time across rapid fires). Wait it out; the
+    # next fire landing after the deadline fetches cleanly. The 4h candle is still there to execute.
+    _state = os.path.join(ROOT, "state")
+    rem = _ban_remaining_ms(_state)
+    if rem > 0:
+        longs, shorts = _book()
+        book = f"LONG {'/'.join(longs)} vs SHORT {'/'.join(shorts)}"
+        print(f"HOLD-ON-DATA-OUTAGE cycle {cycle}: Binance -1003 ban still active for "
+              f"~{rem // 60000}m — skipping scout to let it lapse (no fetch = no re-extend), book "
+              f"held. {book}")
+        return 0
+
     # A DATA OUTAGE (Binance rate-limit 418/-1003, network) makes scout/preflight produce no file.
     # That is transient, not a code bug: HOLD the book and retry next tick (exit 0 so the cron does
     # NOT flag it for investigation), never crash. The book is untouched — the gate has not run.
     sc = run(["scripts/scout_cli.py", "--cycle", str(cycle), "--top", "12"])
     upath = os.path.join(cdir, "universe.json")
     if not os.path.exists(upath):
+        # record any -1003 ban deadline so the NEXT fire holds before fetching (self-heal)
+        _bu = _parse_ban_until_ms(sc.stderr) or _parse_ban_until_ms(sc.stdout)
+        if _bu:
+            _record_ban(_state, _bu)
         longs, shorts = _book()
         book = f"LONG {'/'.join(longs)} vs SHORT {'/'.join(shorts)}"
+        _bnote = f" (ban until {_bu}, holding next fires until it lapses)" if _bu else ""
         print(f"HOLD-ON-DATA-OUTAGE cycle {cycle}: scout produced no universe (Binance "
-              f"rate-limit/network) — book held, retry next tick. {book} | "
+              f"rate-limit/network){_bnote} — book held, retry next tick. {book} | "
               f"err: {sc.stderr.strip()[-160:]}")
         return 0
     uni = json.load(open(upath))
