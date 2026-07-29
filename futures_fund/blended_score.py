@@ -297,7 +297,8 @@ def make_room_for_adds(plan: dict, holdings: dict[str, str],
 
 
 def apply_hysteresis(scored: list[dict], holdings: dict[str, str], n_per_side: int = 3,
-                     keep_buffer: int = 2, swap_margin: float = 0.5) -> dict:
+                     keep_buffer: int = 2, swap_margin: float = 0.5,
+                     openable: set[str] | None = None) -> dict:
     """Minimum-rebalance rotation with a SWAP MARGIN (the core anti-churn mechanism).
 
     The target sleeves are the top-N (long) / bottom-N (short) by score, but a HELD leg is only
@@ -306,7 +307,14 @@ def apply_hysteresis(scored: list[dict], holdings: dict[str, str], n_per_side: i
     held leg that has crossed to the OTHER sleeve is closed (it cannot same-cycle flip — the gate
     can't reliably close+reopen the same symbol opposite in one pass, so it re-enters next cycle).
     `keep_buffer` is reserved (the swap margin now provides stickiness, not a rank band).
-    """
+
+    `openable` (optional): the set of symbols that can actually be OPENED as a NEW leg this cycle —
+    i.e. names in the fresh scout universe. A stale ex-holding still lingering in `scored` but no
+    longer held AND not in the scout universe (cy205 BNB) would otherwise be ranked into a sleeve as
+    a new open, then silently dropped by the gate (it has no live proposal), leaving a persistent
+    count-imbalance (L2/S3). When supplied, a NON-HELD candidate must be in `openable` to be
+    eligible for a new open; HELD legs are unaffected (they can always be kept or closed). None =>
+    every scored name is openable (legacy behavior, unchanged)."""
     _ = keep_buffer
     score = {s["symbol"]: s["score"] for s in scored}
     present = set(score)
@@ -314,12 +322,17 @@ def apply_hysteresis(scored: list[dict], holdings: dict[str, str], n_per_side: i
     def side_val(sym: str, direction: str) -> float:
         return score[sym] if direction == "long" else -score[sym]
 
+    def _can_open(sym: str) -> bool:
+        # a NON-HELD name may only fill a slot if it is actually openable this cycle
+        return openable is None or sym in holdings or sym in openable
+
     close = [s for s in holdings if s not in present]      # left the universe
 
     def build(direction: str) -> list[str]:
-        # candidates exclude names held on the OPPOSITE sleeve (no same-cycle flip)
+        # candidates exclude names held on the OPPOSITE sleeve (no same-cycle flip); a non-held
+        # candidate must also be OPENABLE (in the fresh universe) to fill a slot
         opp = "short" if direction == "long" else "long"
-        cands = sorted([s for s in present if holdings.get(s) != opp],
+        cands = sorted([s for s in present if holdings.get(s) != opp and _can_open(s)],
                        key=lambda s: side_val(s, direction), reverse=True)
         held = sorted([s for s, d in holdings.items()
                        if d == direction and s in present and s not in close],

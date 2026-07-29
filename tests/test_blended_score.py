@@ -256,6 +256,37 @@ def test_hysteresis_does_not_churn_on_tiny_margin():
     assert "NEW" not in plan["open_long"]
 
 
+def test_hysteresis_does_not_open_a_non_openable_stale_ex_holding():
+    # cy205 BNB shape: STALE is a top-ranked long-side name that is NEITHER held NOR in the fresh
+    # scout universe (a just-closed ex-holding still lingering in the briefs). It must NOT be opened
+    # as a new leg (the gate would silently drop it -> a persistent count-imbalance L2/S3). The long
+    # slot must instead go to an OPENABLE candidate so the book fills to n_per_side.
+    scored = _scored([("STALE", 2.0), ("OPEN1", 1.5), ("OPEN2", 1.0),
+                      ("SHRT1", -1.0), ("SHRT2", -1.5), ("SHRT3", -2.0)])
+    holdings = {"SHRT1": "short", "SHRT2": "short"}
+    openable = {"OPEN1", "OPEN2", "SHRT1", "SHRT2", "SHRT3"}  # STALE deliberately excluded
+    plan = bs.apply_hysteresis(scored, holdings, n_per_side=2, swap_margin=0.5,
+                               openable=openable)
+    # STALE is never proposed as a new open
+    assert "STALE" not in plan["open_long"]
+    # the long side still fills to 2 from openable names -> no count-imbalance
+    assert len(plan["keep_long"] + plan["open_long"]) == 2
+    assert set(plan["open_long"]) <= {"OPEN1", "OPEN2"}
+
+
+def test_hysteresis_still_keeps_a_held_leg_absent_from_openable():
+    # a HELD leg that has dropped out of the scout universe (not in openable) is still KEEPABLE —
+    # openable only gates NEW opens, never forces a churn of an in-universe-scored held position.
+    # Held AAA/CCC are the strongest on their own sleeve so no challenger beats them by swap_margin.
+    scored = _scored([("AAA", 2.0), ("BBB", 0.1), ("CCC", -2.0)])
+    holdings = {"AAA": "long", "CCC": "short"}
+    openable = {"BBB"}  # held AAA/CCC absent from openable but still present in scores
+    plan = bs.apply_hysteresis(scored, holdings, n_per_side=1, swap_margin=0.5,
+                               openable=openable)
+    assert "AAA" in plan["keep_long"] and "CCC" in plan["keep_short"]
+    assert "AAA" not in plan["close"] and "CCC" not in plan["close"]
+
+
 # ---- deployment top-up (COORDINATED book-level resize toward ~1x) ----------------
 def test_deployment_resizes_refills_a_deeply_underdeployed_book():
     # 3L/3S book all at ~$755/leg (0.46x). min side gross $2265 << B ($4875) -> the book is

@@ -58,10 +58,23 @@ def main() -> None:
         if os.path.exists(os.path.join(args.state, "positions.json")) else []
     holdings = {p["symbol"]: p["direction"] for p in positions}
 
+    # OPENABLE = fresh scout universe (∪ held). A stale ex-holding still lingering in the briefs but
+    # no longer held AND no longer in the scout universe can only be KEPT/CLOSED, never OPENED as a
+    # new leg — else its open proposal is silently dropped downstream (no live universe entry) and
+    # the book sticks count-imbalanced (cy205 BNB L2/S3). Held names stay openable so nothing that
+    # is legitimately on the book is forced to churn.
+    openable = None
+    upath = os.path.join(cdir, "universe.json")
+    if os.path.exists(upath):
+        uni = json.load(open(upath))
+        uni_syms = [_raw(s["symbol"]) for s in uni.get("universe", uni.get("candidates", []))]
+        openable = set(uni_syms) | set(holdings)
+
     scored = bs.composite_scores(briefs)
     weights = scored[0]["weights"] if scored else {}
     plan = bs.apply_hysteresis(scored, holdings, n_per_side=args.n_per_side,
-                               keep_buffer=args.keep_buffer, swap_margin=args.swap_margin)
+                               keep_buffer=args.keep_buffer, swap_margin=args.swap_margin,
+                               openable=openable)
 
     # DEPLOYMENT TOP-UP: grow frozen-undersized KEPT legs toward the per-leg target (~equity/2 per
     # side) by CLOSE+REOPEN — held legs can't pyramid, so the only gate-respecting way to enlarge a
