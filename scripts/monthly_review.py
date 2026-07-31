@@ -306,6 +306,9 @@ def main():
 
     report = {
         "review_date": review_date,
+        # WHEN THIS REVIEW RAN — the driver's 30-day gate keys off this. The filename is the month
+        # REVIEWED and is rewritten in place on a re-run, so it can't date the run itself (cy216).
+        "run_ts": datetime.now().isoformat(timespec="seconds"),
         "review_period_days": args.days,
         "performance": perf,
         "churn": rot,

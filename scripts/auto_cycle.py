@@ -16,7 +16,7 @@ import re
 import subprocess
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PY = [sys.executable]
@@ -102,54 +102,98 @@ def _gate_exposure(cycle: int):
         return None
 
 
-def _check_monthly_review() -> bool:
-    """Check if monthly review is needed (>30 days since last run).
+_REVIEW_MIN_DAYS = 30
 
-    Returns True if review was run, False otherwise.
+
+def _last_review_ts(review_dir) -> datetime | None:
+    """When the monthly review LAST RAN — None if it never has.
+
+    Keyed off the `run_ts` stamped inside each report, falling back to the file mtime. NOT off the
+    filename: a report is named for the month it COVERS (`YYYY-MM.json`) and is rewritten in place
+    on a re-run, so the name never advances. Reading the date from it pinned "last review" to the
+    1st of the month, which made the gate re-fire on EVERY 30-min tick from the 31st onward (cy216).
     """
-    review_dir = os.path.join(ROOT, "state", "monthly_review")
-    if not os.path.exists(review_dir):
-        os.makedirs(review_dir, exist_ok=True)
-
-    # Find the most recent review file
-    reviews = []
-    for f in os.listdir(review_dir):
-        if f.endswith(".json") and f.count("-") == 1:  # YYYY-MM.json format
+    try:
+        names = sorted(os.listdir(review_dir))
+    except OSError:                                  # no review dir yet -> never run
+        return None
+    latest = None
+    for f in names:
+        if not f.endswith(".json"):
+            continue
+        p = os.path.join(review_dir, f)
+        ts = None
+        try:
+            ts = datetime.fromisoformat(json.load(open(p))["run_ts"])
+            if ts.tzinfo is not None:                # normalize: never mix aware/naive datetimes
+                ts = ts.astimezone().replace(tzinfo=None)
+        except Exception:  # noqa: BLE001 — legacy/partial report -> fall back to the file mtime
             try:
-                year, month = map(int, f[:-5].split("-"))
-                reviews.append(datetime(year, month, 1))
-            except (ValueError, IndexError):
+                ts = datetime.fromtimestamp(os.path.getmtime(p))
+            except OSError:
                 continue
+        if latest is None or ts > latest:
+            latest = ts
+    return latest
 
-    if not reviews:
-        # No review yet - run one
-        last_review = None
-    else:
-        last_review = max(reviews)
 
-    now = datetime.now()
-    days_since_review = (now - last_review).days if last_review else 999
-
-    if days_since_review >= 30:
-        # Time to run monthly review
-        print(f"\n[MONTHLY REVIEW] Running - last review {days_since_review} days ago...")
-        mr = run(["scripts/monthly_review.py", "--days", "60"])
-
-        # Print just the summary lines
-        lines = mr.stdout.strip().split("\n")
-        in_summary = False
-        for line in lines:
-            if "RECOMMENDATIONS" in line:
-                in_summary = True
-            if in_summary or "Performance:" in line or "Churn:" in line or "Neutrality:" in line:
-                print(f"  {line}")
-
-        if mr.returncode != 0:
-            print(f"  Review error: {mr.stderr.strip()[-200:]}")
-
+def _monthly_review_due(review_dir, now: datetime | None = None,
+                        min_days: int = _REVIEW_MIN_DAYS) -> bool:
+    """True when the blended-score parameter review is due (never run, or >= min_days ago)."""
+    last = _last_review_ts(review_dir)
+    if last is None:
         return True
+    return ((now or datetime.now()) - last) >= timedelta(days=min_days)
 
-    return False
+
+def _review_summary_line(report: dict) -> str:
+    """One-line verdict from a review report — the loop only ever shows this."""
+    perf = report.get("performance") or {}
+    neut = report.get("neutrality") or {}
+    recs = report.get("recommendations") or []
+    mo = perf.get("monthly_return_pct")
+    dd = perf.get("max_drawdown_pct")
+    parts = [f"{mo:+.2f}%/mo" if mo is not None else "n/a %/mo",
+             f"maxDD {dd:.2f}%" if dd is not None else "maxDD n/a",
+             f"{neut.get('neutrality_violations', '?')} neutrality violations",
+             f"{perf.get('cycles_analyzed', '?')} cycles"]
+    tail = "none" if not recs else ", ".join(str(r.get("type", "?")) for r in recs)
+    return " | ".join(parts) + f" | recs: {tail}"
+
+
+def _check_monthly_review() -> bool:
+    """Run the blended-score parameter review if it is due. True if it ran."""
+    review_dir = os.path.join(ROOT, "state", "monthly_review")
+    last = _last_review_ts(review_dir)
+    if not _monthly_review_due(review_dir):
+        return False
+
+    ago = f"{(datetime.now() - last).days}d ago" if last else "never run"
+    print(f"\n[MONTHLY REVIEW] due (last: {ago}) — validating blended-score parameters...")
+    mr = run(["scripts/monthly_review.py", "--days", "60"])
+    if mr.returncode != 0:
+        print(f"  review FAILED rc={mr.returncode}: {mr.stderr.strip()[-200:]}")
+        return False
+
+    # Report from the written JSON, not by grepping stdout (the old filter matched only the bare
+    # section HEADERS, so the loop printed "Performance:"/"Neutrality:" with no numbers at all).
+    ts = _last_review_ts(review_dir)
+    latest = None
+    try:
+        files = [f for f in os.listdir(review_dir) if f.endswith(".json")]
+        latest = max(files) if files else None
+    except OSError:
+        pass
+    if latest:
+        try:
+            print("  " + _review_summary_line(json.load(open(os.path.join(review_dir, latest)))))
+            print(f"  report: state/monthly_review/{latest}")
+        except Exception as e:  # noqa: BLE001 — never let reporting break the driver
+            print(f"  review ran but its report is unreadable: {e}")
+    if ts is None:
+        # No run_ts and no readable mtime => the gate can't advance and would re-fire every tick.
+        print("  WARNING: no review timestamp recorded — gate may re-fire next tick.")
+    return True
 
 
 def main() -> int:
