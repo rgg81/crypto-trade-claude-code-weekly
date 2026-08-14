@@ -105,19 +105,19 @@ def _gate_exposure(cycle: int):
 _REVIEW_MIN_DAYS = 30
 
 
-def _last_review_ts(review_dir) -> datetime | None:
-    """When the monthly review LAST RAN — None if it never has.
+def _review_ts_extreme(review_dir, *, latest: bool) -> datetime | None:
+    """Earliest (latest=False) or most recent (latest=True) review RUN timestamp.
 
     Keyed off the `run_ts` stamped inside each report, falling back to the file mtime. NOT off the
     filename: a report is named for the month it COVERS (`YYYY-MM.json`) and is rewritten in place
-    on a re-run, so the name never advances. Reading the date from it pinned "last review" to the
-    1st of the month, which made the gate re-fire on EVERY 30-min tick from the 31st onward (cy216).
+    on a re-run, so the name never advances. Deriving the date from it pinned "last review" to the
+    1st of the month and re-fired the review on EVERY 30-min tick from the 31st onward (cy216).
     """
     try:
         names = sorted(os.listdir(review_dir))
     except OSError:                                  # no review dir yet -> never run
         return None
-    latest = None
+    best = None
     for f in names:
         if not f.endswith(".json"):
             continue
@@ -132,18 +132,44 @@ def _last_review_ts(review_dir) -> datetime | None:
                 ts = datetime.fromtimestamp(os.path.getmtime(p))
             except OSError:
                 continue
-        if latest is None or ts > latest:
-            latest = ts
-    return latest
+        if best is None or (ts > best if latest else ts < best):
+            best = ts
+    return best
+
+
+def _last_review_ts(review_dir) -> datetime | None:
+    """When the monthly review LAST RAN — None if it never has."""
+    return _review_ts_extreme(review_dir, latest=True)
+
+
+def _review_anchor(review_dir) -> datetime | None:
+    """The EARLIEST review run — the fixed point the schedule hangs off. None if never reviewed."""
+    return _review_ts_extreme(review_dir, latest=False)
 
 
 def _monthly_review_due(review_dir, now: datetime | None = None,
                         min_days: int = _REVIEW_MIN_DAYS) -> bool:
-    """True when the blended-score parameter review is due (never run, or >= min_days ago)."""
+    """True when the parameter review is due, on a cadence ANCHORED to the first review.
+
+    Boundaries fall at `anchor + min_days * k`. A review is due once the current boundary has
+    passed and nothing has run since it. Keying off the LAST run instead made the schedule slip
+    every time anyone ran the review by hand: two ad-hoc runs on 2026-08-14 pushed the next
+    automatic fire from 2026-08-30 to 2026-09-13. A monthly review that drifts whenever it is
+    inspected is not a monthly review — so manual runs are recorded but move no boundary.
+
+    A boundary missed while the loop was down (the 2026-08-08..13 outage) still fires late, since
+    the test is "has anything run since the boundary", not "did it run exactly on it".
+    """
+    anchor = _review_anchor(review_dir)
+    if anchor is None:
+        return True                                   # never reviewed -> run one now
+    ref = now or datetime.now()
+    elapsed = (ref - anchor).days
+    if elapsed < min_days:
+        return False
+    boundary = anchor + timedelta(days=min_days * (elapsed // min_days))
     last = _last_review_ts(review_dir)
-    if last is None:
-        return True
-    return ((now or datetime.now()) - last) >= timedelta(days=min_days)
+    return last is None or last < boundary
 
 
 def _review_summary_line(report: dict) -> str:
