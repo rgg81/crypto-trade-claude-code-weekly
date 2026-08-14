@@ -17,7 +17,7 @@ Usage:
 import argparse
 import json
 import sys
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 
 import numpy as np
@@ -238,6 +238,144 @@ def cost_decomposition(trades: list[dict], reduce_realized: float = 0.0) -> dict
     }
 
 
+STOP_CANDIDATES = (0.75, 1.0, 1.25, 1.5, 1.75, 2.0, 2.5)
+
+
+def build_close_series(state_dir) -> tuple[dict, dict]:
+    """(cycle -> timestamp, cycle -> {symbol: close}) from the stored cycle contexts.
+
+    This is the only price history the desk keeps: 4h closes, no intrabar high/low. `detect_exit`
+    triggers on bar high/low, so any replay built on this UNDERCOUNTS stop hits — see _STOP_CAVEAT.
+    """
+    cycle_ts, closes = {}, {}
+    cdir = Path(state_dir) / "cycle"
+    if not cdir.is_dir():
+        return cycle_ts, closes
+    for d in cdir.iterdir():
+        if not d.name.isdigit():
+            continue
+        ctx = d / "context.json"
+        try:
+            briefs = json.loads(ctx.read_text())["briefs"]
+        except (OSError, ValueError, KeyError):
+            continue
+        c = int(d.name)
+        cycle_ts[c] = datetime.fromtimestamp(ctx.stat().st_mtime, tz=UTC)
+        closes[c] = {_raw_symbol(b["symbol"]): b["last_close"]
+                     for b in briefs if b.get("last_close") and b.get("symbol")}
+    return cycle_ts, closes
+
+
+def _raw_symbol(s: str) -> str:
+    return s.split("/")[0] + "USDT" if "/" in s else s
+
+
+def _parse_ts(v):
+    try:
+        return datetime.fromisoformat(str(v).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+
+
+def replay_stop_delta(trades: list[dict], cycle_ts: dict, closes: dict, mult: float,
+                      live_mult: float = 2.0) -> float:
+    """PnL delta vs the live stop, replaying each trade against a stop at `mult` x ATR.
+
+    ATR is recovered from the recorded structure (`|entry - stop| / live_mult`). A trade whose
+    tighter stop is breached before its actual exit is re-priced at that stop; everything else
+    keeps its realized outcome.
+    """
+    ordered = sorted(cycle_ts)
+    delta = 0.0
+    for r in trades:
+        sym, d = r.get("symbol"), r.get("direction")
+        e, st, sz = _num(r.get("entry")), _num(r.get("stop")), _num(r.get("size"))
+        t0, t1 = _parse_ts(r.get("ts")), _parse_ts(r.get("exit_ts"))
+        if not (sym and d and e > 0 and st > 0 and sz > 0 and t0 and t1) or mult == live_mult:
+            continue
+        atr = abs(e - st) / live_mult
+        stop_m = e - mult * atr if d == "long" else e + mult * atr
+        for c in ordered:
+            tc = cycle_ts.get(c)
+            if tc is None or not (t0 < tc <= t1):
+                continue
+            px = closes.get(c, {}).get(sym)
+            if px is None:
+                continue
+            if (d == "long" and px <= stop_m) or (d == "short" and px >= stop_m):
+                gross = sz * (stop_m - e) if d == "long" else sz * (e - stop_m)
+                delta += (gross - trade_fee(sz * stop_m, maker=False)) - _num(r.get("realized_pnl"))
+                break
+    return delta
+
+
+def evaluate_stop_multiples(trades: list[dict], state_dir, live_mult: float = 2.0,
+                            candidates=None) -> dict:
+    """Replay every candidate stop distance, split-half, for `stop_multiple_verdict`."""
+    cycle_ts, closes = build_close_series(state_dir)
+    dated = sorted([t for t in trades if _parse_ts(t.get("ts"))],
+                   key=lambda t: _parse_ts(t["ts"]))
+    half = len(dated) // 2
+    out = {}
+    for m in (candidates or STOP_CANDIDATES):
+        if m == live_mult:
+            continue
+        out[m] = {
+            "total": replay_stop_delta(dated, cycle_ts, closes, m, live_mult),
+            "first_half": replay_stop_delta(dated[:half], cycle_ts, closes, m, live_mult),
+            "second_half": replay_stop_delta(dated[half:], cycle_ts, closes, m, live_mult),
+        }
+    return out
+
+
+_STOP_CAVEAT = ("close-only replay (no intrabar high/low is stored) — it UNDERCOUNTS stop hits "
+                "and therefore flatters tighter stops; treat as indicative, not a backtest")
+
+
+def stop_multiple_verdict(candidates: dict, live_mult: float = 2.0,
+                          min_gain: float = 100.0) -> dict:
+    """Pick an `atr_mult` change ONLY on evidence that survives a split-half check.
+
+    `candidates` maps multiple -> {"total", "first_half", "second_half"} PnL deltas vs the live
+    multiple. A candidate qualifies only when BOTH halves improve (same sign, both positive) and
+    the total gain clears `min_gain`.
+
+    This gate exists because the aggregate number lies. On 310 live trades atr_mult=0.75 replayed
+    +$268 better than live — but -$188 in the first half and +$423 in the second: regime luck.
+    Recommending on the aggregate would ratchet the desk onto whatever the last regime rewarded,
+    which is the classic way a "monthly optimization" destroys a working parameter.
+    """
+    scored = {}
+    for mult, r in candidates.items():
+        total, first, second = (_num(r.get("total")), _num(r.get("first_half")),
+                                _num(r.get("second_half")))
+        consistent = first > 0 and second > 0
+        scored[mult] = {"total": round(total, 2), "first_half": round(first, 2),
+                        "second_half": round(second, 2), "consistent": consistent,
+                        "material": total >= min_gain}
+    qualified = {m: s for m, s in scored.items()
+                 if m != live_mult and s["consistent"] and s["material"]}
+    if qualified:
+        best = max(qualified, key=lambda m: qualified[m]["total"])
+        return {"recommend": best, "expected_gain": qualified[best]["total"],
+                "reason": (f"atr_mult={best} improved in BOTH halves "
+                           f"({qualified[best]['first_half']:+.2f} / "
+                           f"{qualified[best]['second_half']:+.2f}) for "
+                           f"{qualified[best]['total']:+.2f} total"),
+                "candidates": scored, "caveat": _STOP_CAVEAT}
+    any_consistent = any(s["consistent"] for m, s in scored.items() if m != live_mult)
+    if not scored:
+        reason = "no candidates evaluated"
+    elif not any_consistent:
+        reason = ("no candidate improved consistently across both halves of the sample "
+                  "(aggregate gains were regime luck, not edge)")
+    else:
+        reason = ("candidates that were consistent did not clear the material-gain threshold "
+                  f"of {min_gain:.2f}")
+    return {"recommend": None, "expected_gain": 0.0, "reason": reason,
+            "candidates": scored, "caveat": _STOP_CAVEAT}
+
+
 def carry_is_income(decomp: dict) -> bool:
     """True when funding is a net CREDIT. The 'carry is doing the work' verdict must not fire on
     a desk that is PAYING funding — there the carry sleeve is a second cost, not the rescue."""
@@ -343,6 +481,10 @@ def main():
     ap.add_argument("--state", default="state", help="State directory")
     ap.add_argument("--memory", default="memory",
                     help="Decisions journal dir (closed-trade PnL/fees/funding)")
+    ap.add_argument("--live-atr-mult", type=float, default=2.0,
+                    help="Stop distance currently live in blended_book_cli._structure")
+    ap.add_argument("--min-stop-gain", type=float, default=100.0,
+                    help="Minimum consistent replay gain (USDT) to propose an atr_mult change")
     args = ap.parse_args()
 
     print(f"\n{'='*60}")
@@ -406,6 +548,28 @@ def main():
         if decomp["unknown_notional"]:
             print(f"  NOTE: {decomp['unknown_notional']} record(s) with unknown notional — "
                   f"entry fees undercounted, so a PASS is withheld")
+
+    # STOP DISTANCE (atr_mult) — replay candidates, but only ever PROPOSE a change that survives
+    # the split-half check. Never auto-applied: atr_mult lives in blended_book_cli._structure and
+    # stays a human decision.
+    try:
+        stop_v = stop_multiple_verdict(
+            evaluate_stop_multiples(_closed, state_dir, live_mult=args.live_atr_mult),
+            live_mult=args.live_atr_mult, min_gain=args.min_stop_gain)
+    except Exception as e:  # noqa: BLE001 — an optional study must never wedge the review
+        stop_v = {"recommend": None, "expected_gain": 0.0, "reason": f"replay failed: {e}"[:200],
+                  "candidates": {}, "caveat": _STOP_CAVEAT}
+    if stop_v["candidates"]:
+        print(f"\nStop distance (live atr_mult={args.live_atr_mult}):")
+        for m in sorted(stop_v["candidates"]):
+            s = stop_v["candidates"][m]
+            mark = "OK " if s["consistent"] else "noise"
+            print(f"  {m:>4}x  total {s['total']:>+9.2f}  "
+                  f"halves {s['first_half']:>+9.2f} / {s['second_half']:>+9.2f}  [{mark}]")
+        _verdict = (f"change to {stop_v['recommend']}" if stop_v["recommend"]
+                    else "NO CHANGE")
+        print(f"  verdict: {_verdict} — {stop_v['reason']}")
+        print(f"  caveat: {stop_v['caveat']}")
 
     # Analyze rotation pattern
     rot = analyze_rotation_pattern(cycles, state_dir)
@@ -515,6 +679,7 @@ def main():
         "performance": perf,
         "churn": rot,
         "cost_decomposition": decomp,
+        "stop_multiple": stop_v,
         "edge_covers_costs": covers,
         "neutrality": neut,
         "recommendations": recommendations,
