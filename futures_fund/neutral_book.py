@@ -23,7 +23,8 @@ from futures_fund.notional_sizing import notional_to_risk_pct
 
 def presize_and_balance(props, *, equity, per_trade_risk_pct, held_long=0.0, held_short=0.0,
                         gross_target=None, max_name_frac=0.25, risk_pct_by_symbol=None,
-                        heat_headroom_by_symbol=None, dust_risk_frac=0.001):
+                        heat_headroom_by_symbol=None, dust_risk_frac=0.001,
+                        aggregate_heat_headroom=None):
     """Stamp risk_mult on each new TradeProposal to target a dollar-neutral book.
 
     `props` — new TradeProposal objects (each carries direction/entry/stop/risk_mult).
@@ -102,6 +103,23 @@ def presize_and_balance(props, *, equity, per_trade_risk_pct, held_long=0.0, hel
     heat_dropped: list[str] = []
     long_legs = _waterfill(longs, tgt_long_total)
     short_legs = _waterfill(shorts, tgt_short_total)
+
+    # AGGREGATE HEAT BUDGET. Per-symbol headroom does not bound the SUM, but consolidate does:
+    #   total = sum(position_risk(t)); if total > max_heat: scale EVERY trade by max_heat/total
+    #   return [t for t in trades if risk(t) >= min_risk_frac]      <- silent dust drop
+    # so an over-heat batch is scaled behind the desk's back and whatever lands under the dust floor
+    # disappears with no record (cy292: 6 submitted, 6 approved, 4 opened, BNB/XRP gone, book stuck
+    # L3/S1 at 32% tilt). Fitting the budget HERE leaves consolidate nothing to scale, so nothing is
+    # dusted silently — and a leg that still cannot clear the floor is surfaced in `heat_dropped`
+    # by the check below. Proportional, so the long/short balance is preserved, and it can only
+    # ever SHRINK (this module never grows a leg).
+    if isinstance(aggregate_heat_headroom, (int, float)) and aggregate_heat_headroom > 0:
+        total_risk = sum(notional_to_risk_pct(n, p.entry, p.stop, equity)
+                         for p, n in (*long_legs, *short_legs))
+        if total_risk > aggregate_heat_headroom:
+            f = aggregate_heat_headroom / total_risk
+            long_legs = [(p, n * f) for p, n in long_legs]
+            short_legs = [(p, n * f) for p, n in short_legs]
     # drop legs the heat ceiling starves below the consolidate dust floor (the gate would size them
     # to dust and consolidate would drop them SILENTLY — surface it here and exclude them upstream)
     def _viable(side_legs):

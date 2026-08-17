@@ -953,7 +953,11 @@ def gate_execute_step(exchange, settings: Settings, state_dir, memory_dir,
             trade_props, neutral_summary = presize_and_balance(
                 trade_props, equity=_nh.equity, per_trade_risk_pct=_ncaps.per_trade_risk_pct,
                 held_long=_nexp.get("gross_long", 0.0), held_short=_nexp.get("gross_short", 0.0),
-                risk_pct_by_symbol=_ptr_by_sym, heat_headroom_by_symbol=_heat_by_sym)
+                risk_pct_by_symbol=_ptr_by_sym, heat_headroom_by_symbol=_heat_by_sym,
+                # consolidate scales the BATCH on the summed stop-risk; per-symbol headroom does
+                # not bound that sum. Pass the residual budget so the pre-sizer fits it up front
+                # and consolidate has nothing left to scale (hence nothing to dust silently).
+                aggregate_heat_headroom=(min(_heat_by_sym.values()) if _heat_by_sym else None))
         except Exception as _pe:  # noqa: BLE001 — advisory sizing; never break the gate, but SURFACE
             # HARD RULE 8: a swallowed pre-size failure silently disables dollar-balancing (the book
             # runs unbalanced / count-imbalanced with no signal). Record the cause so the operator
