@@ -137,17 +137,36 @@ def presize_and_balance(props, *, equity, per_trade_risk_pct, held_long=0.0, hel
     # applies when BOTH sides are PRESENT (held>0 or a viable new leg) — a deliberately one-sided
     # submission still deploys (soft neutrality; the post-gate canary flags it), never trimmed to
     # zero against an absent side.
-    l_ach = sum(n for _, n in long_legs)
-    s_ach = sum(n for _, n in short_legs)
-    long_present = held_long > 0 or l_ach > 0
-    short_present = held_short > 0 or s_ach > 0
-    if heat_headroom_by_symbol is not None and long_present and short_present:
+    def _trim(l_legs, s_legs):
+        l_ach = sum(n for _, n in l_legs)
+        s_ach = sum(n for _, n in s_legs)
+        if not (heat_headroom_by_symbol is not None
+                and (held_long > 0 or l_ach > 0) and (held_short > 0 or s_ach > 0)):
+            return l_legs, s_legs
         final = min(held_long + l_ach, held_short + s_ach)
         l_add, s_add = max(0.0, final - held_long), max(0.0, final - held_short)
         l_scale = (l_add / l_ach) if l_ach > 0 else 0.0
         s_scale = (s_add / s_ach) if s_ach > 0 else 0.0
-        long_legs = [(p, n * l_scale) for p, n in long_legs]
-        short_legs = [(p, n * s_scale) for p, n in short_legs]
+        return ([(p, n * l_scale) for p, n in l_legs],
+                [(p, n * s_scale) for p, n in s_legs])
+
+    # The dust check above runs on WATER-FILLED sizes, but the symmetric trim below shrinks a side
+    # further — so a leg could pass as viable and then be trimmed under the floor, where consolidate
+    # discards it silently (`[t for t in trades if risk(t) >= min_risk_frac]`). That is what ate
+    # BTCUSDT and ETHUSDT at cy293: tightest stops (0.93%, 1.22%) sit nearest the floor because
+    # risk = notional * stop_frac / equity, so the majors go under first. Re-check AFTER the trim,
+    # and when a leg drops out re-water-fill the survivors so its budget is not stranded. Bounded:
+    # each pass removes at least one leg, and it always converges to fewer legs, never more.
+    for _ in range(len(props) + 1):
+        t_long, t_short = _trim(long_legs, short_legs)
+        v_long, v_short = _viable(t_long), _viable(t_short)
+        if len(v_long) == len(t_long) and len(v_short) == len(t_short):
+            long_legs, short_legs = t_long, t_short
+            break
+        long_legs = _waterfill([p for p, _ in v_long], tgt_long_total)
+        short_legs = _waterfill([p for p, _ in v_short], tgt_short_total)
+    else:                                             # pathological: keep the trimmed survivors
+        long_legs, short_legs = _trim(long_legs, short_legs)
 
     kept = []
     for p, n in long_legs:
