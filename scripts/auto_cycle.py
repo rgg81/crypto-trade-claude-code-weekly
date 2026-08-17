@@ -11,6 +11,7 @@ Usage: uv run python scripts/auto_cycle.py     # runs the cycle if DUE, else pri
 Exit codes: 0 ok (ran or skipped), 1 error.
 """
 import json
+import math
 import os
 import re
 import subprocess
@@ -187,6 +188,34 @@ def _review_summary_line(report: dict) -> str:
     return " | ".join(parts) + f" | recs: {tail}"
 
 
+# Max fraction the neutrality guard may trim off a sleeve in ONE pass. One missing leg out of
+# n_per_side=3 needs |3-2|/3 = 0.333, so the routine case still corrects fully; the cap only bites
+# when more than one leg is gone — the runaway that took cy291 to 0.11x deployment.
+_GUARD_TRIM_CAP = 0.35
+
+
+def _guard_trim(gross_long: float, gross_short: float,
+                cap: float = _GUARD_TRIM_CAP) -> tuple[str, float, bool]:
+    """(oversized side, trim fraction, was_capped) to bring the book back toward neutral.
+
+    Trimming by the FULL gross difference is right for rotation asymmetry but wrong when a leg is
+    missing: an L3/S1 book means trimming the long sleeve 83% to match one surviving short, which
+    is not neutrality but liquidation — deployment went 0.85x -> 0.11x at cy290-291 and the book
+    could not climb back out. Capping leaves residual tilt for one cycle, which the refill then
+    closes; bounded tilt beats an unbounded deployment collapse. The cap can only ever make the
+    guard shrink LESS, never more.
+    """
+    gl, gs = max(0.0, gross_long), max(0.0, gross_short)
+    big = "short" if gs > gl else "long"
+    denom = max(gl, gs, 1e-9)
+    frac = abs(gs - gl) / denom
+    if frac <= cap:
+        # FLOOR, never round-half: rounding up would trim MORE than the true difference, breaking
+        # the "the guard may only ever shrink less" invariant.
+        return big, math.floor(frac * 10000) / 10000, False
+    return big, cap, True
+
+
 def _snapshot_pre_guard(cdir, rep) -> None:
     """Preserve the gate's OWN report + the blended plan before the neutrality guard runs.
 
@@ -352,8 +381,12 @@ def main() -> int:
         # snapshot FIRST — the guard's own gate pass overwrites report.json/proposals.json
         _snapshot_pre_guard(cdir, rep)
         gl, gs = e["gross_long"], e["gross_short"]
-        big = "short" if gs > gl else "long"
-        frac = round(abs(gs - gl) / max(gs, gl, 1e-9), 4)
+        big, frac, capped = _guard_trim(gl, gs)
+        if capped:
+            print(f"  GUARD CAPPED: neutralising would need "
+                  f"{abs(gs - gl) / max(gs, gl, 1e-9):.1%} off the {big} sleeve — that is a "
+                  f"MISSING LEG, not an oversized sleeve. Trimming {frac:.0%} instead and "
+                  f"leaving residual tilt for the next cycle's refill to close.")
         ps = json.load(open(os.path.join(ROOT, "state", "positions.json")))
         mgmt = []
         for x in ps:
