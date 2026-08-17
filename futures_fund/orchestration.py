@@ -26,6 +26,7 @@ from futures_fund.reduce import reduce_position
 from futures_fund.reflect import reflection_payload
 from futures_fund.screen import screen_reports
 from futures_fund.state import is_halted, load_account, load_positions, save_account, save_positions
+from scripts.reconcile import unexplained_opens
 
 _AGENT_KEY = "team"
 
@@ -971,6 +972,21 @@ def gate_execute_step(exchange, settings: Settings, state_dir, memory_dir,
                                close_absent=not has_review, force_close=force_close, loop=loop)
     report["dropped"] = dropped
     report["drop_reasons"] = drop_reasons          # per-proposal cause (never a silent count)
+    # SILENT-LOSS CANARY: a leg can vanish inside the protected risk path with no record —
+    # consolidation.consolidate() batch-scales to the gross-heat cap then returns only the trades
+    # still above the dust risk floor, so a scaled-down leg is simply absent. At cy290-292 that ate
+    # two short legs a cycle while `dropped`/`vetoed` both read 0, leaving the book stuck at L3/S1
+    # with nothing in any report to explain it. The dust drop is legitimate and PROTECTED; this only
+    # makes it visible.
+    try:
+        _silent = unexplained_opens([p.symbol for p in trade_props], report)
+        report["silent_dropped"] = _silent
+        if _silent:
+            report.setdefault("warnings", []).extend(
+                f"SILENT-LOSS {s}: submitted but neither opened nor reported as dropped/vetoed "
+                f"(consolidate dust floor / heat scale)" for s in _silent)
+    except Exception:  # noqa: BLE001 — telemetry must never break the gate
+        report["silent_dropped"] = []
     if drop_reasons:
         report.setdefault("warnings", []).extend(f"DROPPED {r}" for r in drop_reasons)
     report["audit_dropped"] = len(audit_dropped)  # anti-hallucination drops (Pillar 4)
