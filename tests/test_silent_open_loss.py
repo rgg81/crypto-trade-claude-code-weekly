@@ -67,3 +67,47 @@ def test_empty_and_malformed_inputs_are_safe():
     assert unexplained_opens([], _rep([])) == []
     assert unexplained_opens(["AAAUSDT"], {}) == ["AAAUSDT"]
     assert unexplained_opens(["AAAUSDT"], {"actions": [None, "junk", {}]}) == ["AAAUSDT"]
+
+
+# ---------------------------------------------------------------- review findings
+
+def test_vetoed_is_an_INT_COUNT_in_production_and_must_not_raise():
+    """cycle.py sets report["vetoed"] = len(vetoed) — an int, not a list. `0 or []` masked this
+    (the canary worked at cy293 by luck); a NONZERO count raised TypeError, was swallowed by the
+    caller's bare except, and the canary went permanently dark exactly when the gate was rejecting
+    things. The original tests passed only because they fabricated vetoed=[{...}]."""
+    rep = {"actions": [{"open": "AAAUSDT"}], "drop_reasons": [], "vetoed": 2}
+    assert unexplained_opens(["AAAUSDT", "BBBUSDT"], rep) is not None   # must not raise
+
+
+def test_unattributable_vetoes_do_not_produce_false_silent_losses():
+    """With only a COUNT we cannot name which leg was vetoed, so a candidate may in fact be
+    explained. Reporting it as a silent loss would cry wolf; suppress instead."""
+    rep = {"actions": [{"open": "AAAUSDT"}], "drop_reasons": [], "vetoed": 1}
+    assert unexplained_opens(["AAAUSDT", "BBBUSDT"], rep) == []
+
+
+def test_zero_veto_count_still_reports_normally():
+    rep = {"actions": [{"open": "AAAUSDT"}], "drop_reasons": [], "vetoed": 0}
+    assert unexplained_opens(["AAAUSDT", "BBBUSDT"], rep) == ["BBBUSDT"]
+
+
+def test_a_reproposed_holding_is_not_a_silent_loss():
+    """A proposal on a symbol already held in the same direction is deliberately left untouched
+    (executor.reconcile / cycle.py's holdings-review path), so it never appears in actions. Without
+    this it would emit a spurious SILENT-LOSS on every agent-driven cycle that re-proposes a
+    holding."""
+    rep = {"actions": [{"open": "AAAUSDT"}], "drop_reasons": [], "vetoed": 0}
+    held = {"BBBUSDT": "long"}
+    out = unexplained_opens(["AAAUSDT", "BBBUSDT"], rep,
+                            held_by_symbol=held, direction_by_symbol={"BBBUSDT": "long"})
+    assert out == []
+
+
+def test_a_reproposed_holding_in_the_OPPOSITE_direction_is_still_reported():
+    """A flip is a genuine open; if it never lands that IS a silent loss."""
+    rep = {"actions": [{"open": "AAAUSDT"}], "drop_reasons": [], "vetoed": 0}
+    out = unexplained_opens(["AAAUSDT", "BBBUSDT"],
+                            rep, held_by_symbol={"BBBUSDT": "long"},
+                            direction_by_symbol={"BBBUSDT": "short"})
+    assert out == ["BBBUSDT"]

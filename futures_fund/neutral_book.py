@@ -113,13 +113,22 @@ def presize_and_balance(props, *, equity, per_trade_risk_pct, held_long=0.0, hel
     # dusted silently — and a leg that still cannot clear the floor is surfaced in `heat_dropped`
     # by the check below. Proportional, so the long/short balance is preserved, and it can only
     # ever SHRINK (this module never grows a leg).
-    if isinstance(aggregate_heat_headroom, (int, float)) and aggregate_heat_headroom > 0:
+    def _fit_aggregate(l_legs, s_legs):
+        """Scale the batch so its SUMMED stop-risk clears the budget. Must be re-applied after
+        every water-fill: the dust/trim loop below re-water-fills survivors to the unconstrained
+        side budgets, which would otherwise restore an over-budget book and hand consolidate
+        something to batch-scale (and dust) after all."""
+        if not (isinstance(aggregate_heat_headroom, (int, float))
+                and aggregate_heat_headroom > 0):
+            return l_legs, s_legs
         total_risk = sum(notional_to_risk_pct(n, p.entry, p.stop, equity)
-                         for p, n in (*long_legs, *short_legs))
-        if total_risk > aggregate_heat_headroom:
-            f = aggregate_heat_headroom / total_risk
-            long_legs = [(p, n * f) for p, n in long_legs]
-            short_legs = [(p, n * f) for p, n in short_legs]
+                         for p, n in (*l_legs, *s_legs))
+        if total_risk <= aggregate_heat_headroom:
+            return l_legs, s_legs
+        f = aggregate_heat_headroom / total_risk
+        return [(p, n * f) for p, n in l_legs], [(p, n * f) for p, n in s_legs]
+
+    long_legs, short_legs = _fit_aggregate(long_legs, short_legs)
     # drop legs the heat ceiling starves below the consolidate dust floor (the gate would size them
     # to dust and consolidate would drop them SILENTLY — surface it here and exclude them upstream)
     def _viable(side_legs):
@@ -163,8 +172,9 @@ def presize_and_balance(props, *, equity, per_trade_risk_pct, held_long=0.0, hel
         if len(v_long) == len(t_long) and len(v_short) == len(t_short):
             long_legs, short_legs = t_long, t_short
             break
-        long_legs = _waterfill([p for p, _ in v_long], tgt_long_total)
-        short_legs = _waterfill([p for p, _ in v_short], tgt_short_total)
+        long_legs, short_legs = _fit_aggregate(
+            _waterfill([p for p, _ in v_long], tgt_long_total),
+            _waterfill([p for p, _ in v_short], tgt_short_total))
     else:                                             # pathological: keep the trimmed survivors
         long_legs, short_legs = _trim(long_legs, short_legs)
 

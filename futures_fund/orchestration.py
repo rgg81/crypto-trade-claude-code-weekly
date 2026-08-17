@@ -22,11 +22,11 @@ from futures_fund.hitrate import hit_rate
 from futures_fund.memory_layout import ensure_memory_layout
 from futures_fund.neutral_book import presize_and_balance
 from futures_fund.portfolio import portfolio_health
+from futures_fund.reconcile import unexplained_opens
 from futures_fund.reduce import reduce_position
 from futures_fund.reflect import reflection_payload
 from futures_fund.screen import screen_reports
 from futures_fund.state import is_halted, load_account, load_positions, save_account, save_positions
-from scripts.reconcile import unexplained_opens
 
 _AGENT_KEY = "team"
 
@@ -955,9 +955,12 @@ def gate_execute_step(exchange, settings: Settings, state_dir, memory_dir,
                 held_long=_nexp.get("gross_long", 0.0), held_short=_nexp.get("gross_short", 0.0),
                 risk_pct_by_symbol=_ptr_by_sym, heat_headroom_by_symbol=_heat_by_sym,
                 # consolidate scales the BATCH on the summed stop-risk; per-symbol headroom does
-                # not bound that sum. Pass the residual budget so the pre-sizer fits it up front
-                # and consolidate has nothing left to scale (hence nothing to dust silently).
-                aggregate_heat_headroom=(min(_heat_by_sym.values()) if _heat_by_sym else None))
+                # not bound that sum. Mirror the budget consolidate ACTUALLY uses — cycle.py calls
+                # consolidate(..., max(0, caps.max_heat - reserved)) with the BOOK regime's caps
+                # (`_ncaps`, from the same frame). Using min-over-legs instead would (a) shrink the
+                # whole batch to the tightest leg's quadrant and under-deploy for no reason, or
+                # (b) exceed consolidate's real budget so the batch is scaled and dusted anyway.
+                aggregate_heat_headroom=max(0.0, _ncaps.max_heat - _used_heat))
         except Exception as _pe:  # noqa: BLE001 — advisory sizing; never break the gate, but SURFACE
             # HARD RULE 8: a swallowed pre-size failure silently disables dollar-balancing (the book
             # runs unbalanced / count-imbalanced with no signal). Record the cause so the operator
@@ -983,7 +986,13 @@ def gate_execute_step(exchange, settings: Settings, state_dir, memory_dir,
     # with nothing in any report to explain it. The dust drop is legitimate and PROTECTED; this only
     # makes it visible.
     try:
-        _silent = unexplained_opens([p.symbol for p in trade_props], report)
+        # held map excludes same-direction re-proposals, which are intentionally left untouched by
+        # executor.reconcile / the holdings-review path and so never appear in `actions`.
+        _held_dir = {p.symbol: p.direction for p in positions}
+        _silent = unexplained_opens([p.symbol for p in trade_props], report,
+                                    held_by_symbol=_held_dir,
+                                    direction_by_symbol={p.symbol: p.direction
+                                                         for p in trade_props})
         report["silent_dropped"] = _silent
         if _silent:
             report.setdefault("warnings", []).extend(

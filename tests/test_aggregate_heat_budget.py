@@ -30,7 +30,7 @@ from futures_fund.neutral_book import presize_and_balance
 EQ = 10000.0
 
 
-def _p(sym, direction, entry=100.0, stop_frac=0.06):
+def _p(sym, direction, stop_frac=0.06, entry=100.0):
     stop = entry * (1 - stop_frac) if direction == "long" else entry * (1 + stop_frac)
     tp = entry * (1 + 2.2 * stop_frac) if direction == "long" else entry * (1 - 2.2 * stop_frac)
     return TradeProposal(symbol=sym, direction=direction, entry=entry, stop=stop,
@@ -133,3 +133,19 @@ def test_zero_or_negative_budget_is_ignored_not_zeroing_the_book():
     kept, _ = presize_and_balance(_six(), equity=EQ, per_trade_risk_pct=0.010,
                                   heat_headroom_by_symbol=heat, aggregate_heat_headroom=0.0)
     assert len(kept) == 6 and all(p.risk_mult > 0 for p in kept)
+
+
+def test_budget_is_respected_even_when_the_dust_loop_refills():
+    """Review finding: the aggregate scale was applied ONCE before the dust/trim loop, but every
+    re-water-fill inside the loop restored the unconstrained side budgets — so a book that lost a
+    leg to dust came back OVER the budget, and consolidate batch-scaled (and could dust) after all.
+
+    Reproduced with the live cy293 stop shape at a 0.02 budget: realised 0.02162 > 0.02.
+    """
+    props = [_p("LINK", "long", 0.0305), _p("BTW", "long", 0.2207),
+             _p("BTC", "short", 0.0093), _p("ETH", "short", 0.0122),
+             _p("HYPE", "short", 0.0268)]
+    heat = {p.symbol: 0.08 for p in props}
+    kept, _ = presize_and_balance(props, equity=EQ, per_trade_risk_pct=0.010,
+                                  heat_headroom_by_symbol=heat, aggregate_heat_headroom=0.02)
+    assert _total_risk(kept) <= 0.02 + 1e-6, "aggregate fit must survive the dust/trim loop"
