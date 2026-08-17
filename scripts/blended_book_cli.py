@@ -95,9 +95,16 @@ def main() -> None:
     ptr = {"low_vol_trend": 0.015, "high_vol_trend": 0.010, "low_vol_range": 0.010,
            "high_vol_range": 0.005, "transition": 0.005}.get(quad, 0.010)
     kept_now = {s: holdings[s] for s in plan["keep_long"] + plan["keep_short"]}
+    # Tell the resizer what THIS cycle will open, so it can tell a mid-rotation side (slot about to
+    # be filled -> defer) from a genuinely STUCK book (nothing planned -> refill). Without this it
+    # deferred on any count imbalance, which is exactly the state the post-gate neutrality guard
+    # leaves behind after trimming to a dropped-open book — deployment collapsed 0.85x -> 0.11x at
+    # cy290-291 and could not climb back out.
+    planned_opens = {"long": len(plan["open_long"]), "short": len(plan["open_short"])}
     resize = bs.deployment_resizes(kept_now, notional_by_sym, equity, args.n_per_side,
                                    band=args.resize_band, per_trade_risk_pct=ptr,
-                                   stop_frac_by_sym=stop_frac_by_sym)
+                                   stop_frac_by_sym=stop_frac_by_sym,
+                                   planned_opens_by_side=planned_opens)
     for sym in resize:                                  # kept-but-undersized -> close + reopen
         (plan["keep_long"] if holdings[sym] == "long" else plan["keep_short"]).remove(sym)
         (plan["open_long"] if holdings[sym] == "long" else plan["open_short"]).append(sym)

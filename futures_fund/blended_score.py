@@ -195,7 +195,8 @@ def _waterfill(legs: list[str], budget: float, ceil) -> dict[str, float]:
 def deployment_resizes(holdings: dict[str, str], notional_by_sym: dict[str, float],
                        equity: float, n_per_side: int, *, band: float = 0.30,
                        per_trade_risk_pct: float | None = None,
-                       stop_frac_by_sym: dict[str, float] | None = None) -> set[str]:
+                       stop_frac_by_sym: dict[str, float] | None = None,
+                       planned_opens_by_side: dict[str, int] | None = None) -> set[str]:
     """COORDINATED deployment top-up: which held legs to CLOSE+REOPEN to grow a frozen book to ~1x.
 
     Held legs can't pyramid (a same-direction re-proposal is "left untouched") and the pre-sizer
@@ -218,14 +219,33 @@ def deployment_resizes(holdings: dict[str, str], notional_by_sym: dict[str, floa
     def _ceil(s):
         return _leg_ceiling(s, equity, per_trade_risk_pct, stop_frac_by_sym, name_cap)
     sides = {d: [s for s in holdings if holdings[s] == d] for d in ("long", "short")}
-    # MID-ROTATION GUARD: only judge deployment on a FULL book (both sides at n_per_side legs). On a
-    # rotation cycle the caller passes just the KEPT legs, so a side is short a slot the rotation-in
-    # will fill THIS cycle; a partial side computes landed = B/kept-count (over-large) and deployed
-    # as a kept-only sum, so legs already at their true B/n_per_side share look under-deployed and a
-    # full-book resize misfires (the rot-12 rotation cycles). Defer: the rotation-in + make_room
-    # deploy this cycle; a later HOLD cycle refills residual drift with the full-book landed.
-    if any(len(sides[d]) != n_per_side for d in ("long", "short")):
-        return set()
+    # MID-ROTATION GUARD: on a rotation cycle the caller passes just the KEPT legs, so a side is
+    # short a slot the rotation-in will fill THIS cycle; a partial side computes landed =
+    # B/kept-count (over-large) and deployed as a kept-only sum, so legs already at their true
+    # B/n_per_side share look under-deployed and a full-book resize misfires (the rot-12 cycles).
+    # Defer THEN — the rotation-in + make_room deploy this cycle.
+    #
+    # But "short a leg" is NOT always mid-rotation. When the neutrality guard trims a book that lost
+    # a leg to a dropped open, the book is left count-imbalanced with NOTHING planned to fill it —
+    # and deferring unconditionally made that state permanent: guard trims -> legs go to dust ->
+    # refill refuses because counts are uneven -> book cannot climb out. That deadlock took
+    # cy290-291 from 0.85x to 0.11x and would have held there indefinitely. So defer only while a
+    # rotation is genuinely in flight; otherwise judge the legs present.
+    # `planned_opens_by_side is None` keeps the original conservative behaviour for callers that
+    # cannot say what the rotation will open (any imbalance -> defer). Only a caller that passes
+    # the plan gets the stuck-book path.
+    if planned_opens_by_side is None:
+        if any(len(sides[d]) != n_per_side for d in ("long", "short")):
+            return set()
+    else:
+        if any(len(sides[d]) > n_per_side for d in ("long", "short")):
+            return set()                          # over-full side: not a deployment question
+        # Any rotation in flight -> defer. A mid-rotation side's `landed` is computed from kept legs
+        # only and is over-large, so resizing on it misfires; one cycle's wait costs nothing. The
+        # deadlock case has NO opens planned at all, so it still resolves here.
+        if any(len(sides[d]) < n_per_side and planned_opens_by_side.get(d, 0) > 0
+               for d in ("long", "short")):
+            return set()
     present = [sum(_ceil(s) for s in legs) for legs in sides.values() if legs]
     book = min([equity / 2.0, *present]) if present else 0.0
     if book <= 0:
