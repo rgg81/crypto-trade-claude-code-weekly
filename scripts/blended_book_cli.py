@@ -14,6 +14,7 @@ import json
 import os
 
 from futures_fund import blended_score as bs
+from futures_fund.effective_risk import effective_per_trade_risk
 
 
 def _raw(sym: str) -> str:
@@ -88,12 +89,18 @@ def main() -> None:
             notional_by_sym[p["symbol"]] = p["qty"] * float(b["last_close"])
             if p.get("entry"):
                 stop_frac_by_sym[p["symbol"]] = abs(p["entry"] - p["stop"]) / p["entry"]
-    # per_trade_risk cap for the leg's risk-mult=1 ceiling — book-level regime quadrant (healthy
-    # tier) is a good proxy; the gate still re-clamps each leg by its own regime, this only decides
-    # which legs are worth a resize (skip those already at their wide-stop ceiling -> no churn).
+    # per_trade_risk cap for the leg's risk-mult=1 ceiling. This MUST match what the gate will
+    # really size with: caps_for halves per_trade_risk at the `caution` health tier and risk_gate
+    # multiplies by the breaker's risk_multiplier again. Taking the quadrant value at the HEALTHY
+    # tier made this up to 4x too generous once a drawdown engaged the ladder, so every leg looked
+    # under-deployed against an inflated ceiling, got flagged close+reopen, reopened at its true
+    # smaller size and was flagged again next cycle — a permanent 4h churn loop paying the 0.14%
+    # round-trip on most of the book while in drawdown (HARD RULE 2).
     quad = (ctx.get("regime_state") or {}).get("quadrant")
     ptr = {"low_vol_trend": 0.015, "high_vol_trend": 0.010, "low_vol_range": 0.010,
            "high_vol_range": 0.005, "transition": 0.005}.get(quad, 0.010)
+    ptr = effective_per_trade_risk(ptr, drawdown_from_peak=float(
+        ctx.get("drawdown_from_peak") or 0.0), health_tier=ctx.get("health_tier"))
     kept_now = {s: holdings[s] for s in plan["keep_long"] + plan["keep_short"]}
     # Tell the resizer what THIS cycle will open, so it can tell a mid-rotation side (slot about to
     # be filled -> defer) from a genuinely STUCK book (nothing planned -> refill). Without this it

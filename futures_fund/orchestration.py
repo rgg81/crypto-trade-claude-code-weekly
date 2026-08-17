@@ -18,6 +18,7 @@ from futures_fund.cycle import (
     execute_proposals,
     fetch_context,
 )
+from futures_fund.effective_risk import breaker_multiplier
 from futures_fund.hitrate import hit_rate
 from futures_fund.memory_layout import ensure_memory_layout
 from futures_fund.neutral_book import presize_and_balance
@@ -943,15 +944,33 @@ def gate_execute_step(exchange, settings: Settings, state_dir, memory_dir,
             # {raw_symbol: heat headroom} = max(0, leg max_heat - used held heat) the SAME way, so
             # the pre-sizer never targets a leg above the gate's per-leg heat clamp and then watches
             # the gate asymmetrically starve it to dust (the cycle-2 net-short flip).
+            # BREAKER-AWARE SIZING. risk_gate.py:88 sizes with
+            #     risk_pct = caps.per_trade_risk_pct * breaker.risk_multiplier * rm
+            # so a pre-sizer fed the RAW ptr models a book twice the size the gate will build. Two
+            # live consequences once the -5% step-down engaged at cy291 (dd 5.59%, multiplier 0.5):
+            # every leg realised HALF its intended risk (deployment stuck ~0.29x), and the dust
+            # check passed legs the gate then halved under consolidate's 0.001 floor, where they
+            # vanished with no record (BTC at cy294; BTC+ETH at cy293 — the arithmetic matches 6/6).
+            # NOTE this deliberately deploys MORE during a drawdown than the broken model did:
+            # it removes an accidental extra halving, so the book reaches the size the breaker
+            # already permits (caps x multiplier), never beyond it. rm stays clamped to (0,1], the
+            # heat cap is untouched, and no limit is weakened — this is not pressing into a
+            # drawdown (HARD RULE 2), it is sizing correctly within the reduced envelope.
+            from futures_fund.equity_log import period_return
+            _brk_mult = breaker_multiplier(
+                _nh.drawdown_from_peak,
+                period_return(state_dir, now, 1), period_return(state_dir, now, 7),
+                period_return(state_dir, now, 30))
             _ptr_by_sym, _heat_by_sym = {}, {}
             for _tp in trade_props:
                 _uni = ctx.raw_to_unified.get(_tp.symbol)
                 if _uni in ctx.frames:
                     _lc = caps_for(simple_regime(ctx.frames[_uni]), _nh)
-                    _ptr_by_sym[_tp.symbol] = _lc.per_trade_risk_pct
+                    _ptr_by_sym[_tp.symbol] = _lc.per_trade_risk_pct * _brk_mult
                     _heat_by_sym[_tp.symbol] = max(0.0, _lc.max_heat - _used_heat)
             trade_props, neutral_summary = presize_and_balance(
-                trade_props, equity=_nh.equity, per_trade_risk_pct=_ncaps.per_trade_risk_pct,
+                trade_props, equity=_nh.equity,
+                per_trade_risk_pct=_ncaps.per_trade_risk_pct * _brk_mult,
                 held_long=_nexp.get("gross_long", 0.0), held_short=_nexp.get("gross_short", 0.0),
                 risk_pct_by_symbol=_ptr_by_sym, heat_headroom_by_symbol=_heat_by_sym,
                 # consolidate scales the BATCH on the summed stop-risk; per-symbol headroom does
