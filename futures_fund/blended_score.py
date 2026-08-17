@@ -237,27 +237,40 @@ def deployment_resizes(holdings: dict[str, str], notional_by_sym: dict[str, floa
     if planned_opens_by_side is None:
         if any(len(sides[d]) != n_per_side for d in ("long", "short")):
             return set()
-    else:
-        if any(len(sides[d]) > n_per_side for d in ("long", "short")):
-            return set()                          # over-full side: not a deployment question
-        # Any rotation in flight -> defer. A mid-rotation side's `landed` is computed from kept legs
-        # only and is over-large, so resizing on it misfires; one cycle's wait costs nothing. The
-        # deadlock case has NO opens planned at all, so it still resolves here.
-        if any(len(sides[d]) < n_per_side and planned_opens_by_side.get(d, 0) > 0
-               for d in ("long", "short")):
-            return set()
+    elif any(len(sides[d]) > n_per_side for d in ("long", "short")):
+        return set()                              # over-full side: not a deployment question
     present = [sum(_ceil(s) for s in legs) for legs in sides.values() if legs]
     book = min([equity / 2.0, *present]) if present else 0.0
     if book <= 0:
         return set()
-    landed = {}
-    for legs in sides.values():
-        landed.update(_waterfill(legs, book, _ceil))
-    deployed = min(sum(notional_by_sym.get(s, 0.0) for s in legs)
-                   for legs in sides.values() if legs)
+    if planned_opens_by_side is None:
+        landed = {}
+        for legs in sides.values():
+            landed.update(_waterfill(legs, book, _ceil))
+        deployed = min(sum(notional_by_sym.get(s, 0.0) for s in legs)
+                       for legs in sides.values() if legs)
+        if deployed >= book * (1.0 - band):
+            return set()                          # already near the achievable book -> no churn
+        return {s for s in holdings if notional_by_sym.get(s, 0.0) < landed.get(s, 0.0) * 0.90}
+
+    # PLAN-AWARE PATH. Judge deployment against the INTENDED book — kept legs plus the slots this
+    # cycle will open — instead of water-filling across kept legs only. Water-filling a partial
+    # side makes each kept leg's target B/kept-count (over-large), which is why the old code had to
+    # bail on any imbalance; measuring per SLOT (B/n_per_side) is correct whether or not the side
+    # is partial, so a rotation no longer blocks the judgement.
+    #
+    # This matters because the two interact: with the long side stuck at dust and the short side
+    # rotating in fresh legs, deferring leaves the longs tiny — and presize_and_balance then pins
+    # the incoming shorts down to the dust long gross (balanced_gross 574 vs a 5035 target). Both
+    # sides must get fresh proposals together or the book cannot grow.
+    per_slot = book / n_per_side
+    incoming = {d: planned_opens_by_side.get(d, 0) * per_slot for d in ("long", "short")}
+    deployed = min(sum(notional_by_sym.get(s, 0.0) for s in sides[d]) + incoming[d]
+                   for d in ("long", "short"))
     if deployed >= book * (1.0 - band):
-        return set()                              # already near the achievable book -> no churn
-    return {s for s in holdings if notional_by_sym.get(s, 0.0) < landed.get(s, 0.0) * 0.90}
+        return set()                              # intended book is near target -> no churn
+    return {s for s in holdings
+            if notional_by_sym.get(s, 0.0) < min(per_slot, _ceil(s)) * 0.90}
 
 
 def make_room_for_adds(plan: dict, holdings: dict[str, str],

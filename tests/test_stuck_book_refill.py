@@ -59,13 +59,24 @@ def test_full_but_starved_book_is_resized():
     assert deployment_resizes(holdings, notional, EQ, 3, planned_opens_by_side={})
 
 
-def test_any_rotation_in_flight_still_defers():
-    """Conservative on purpose: a mid-rotation side's `landed` is computed from kept legs only and
-    is over-large, so resizing against it misfires. Waiting one cycle costs nothing, and the
-    deadlock case (no opens planned at all) still resolves."""
-    holdings, notional = _book([275.0, 278.0], [21.0])
+def test_a_stuck_side_is_resized_even_while_the_other_side_rotates():
+    """The LIVE cy291 shape: 3 dust longs held, 3 shorts opening this cycle.
+
+    Deferring here leaves the longs at dust, and presize_and_balance then pins the incoming shorts
+    down to the dust long gross — so the book cannot grow. Both sides must get fresh proposals.
+    """
+    holdings, notional = _book([275.0, 278.0, 21.0], [])
     out = deployment_resizes(holdings, notional, EQ, 3,
-                             planned_opens_by_side={"long": 1})
+                             planned_opens_by_side={"long": 0, "short": 3})
+    assert out == {"L0USDT", "L1USDT", "L2USDT"}, "the stuck dust longs must be resized"
+
+
+def test_healthy_mid_rotation_is_still_left_alone():
+    """A full-size book with one slot rotating must NOT churn: the incoming leg counts toward the
+    intended book, so deployment already measures as adequate."""
+    holdings, notional = _book([1679.0, 1679.0, 1679.0], [1679.0, 1679.0])
+    out = deployment_resizes(holdings, notional, EQ, 3,
+                             planned_opens_by_side={"long": 0, "short": 1})
     assert out == set()
 
 
