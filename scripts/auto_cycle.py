@@ -187,6 +187,32 @@ def _review_summary_line(report: dict) -> str:
     return " | ".join(parts) + f" | recs: {tail}"
 
 
+def _snapshot_pre_guard(cdir, rep) -> None:
+    """Preserve the gate's OWN report + the blended plan before the neutrality guard runs.
+
+    The guard writes a trim-only `proposals.json` and re-runs the gate, so `report.json` ends up
+    describing the TRIM, not the execution: `dropped: 0`, `drop_reasons: []`, `proposals: []`.
+    At cy290/291 short opens were dropped, the guard trimmed the long sleeve 12% then 83% to force
+    neutrality, deployment collapsed 0.85x -> 0.11x — and the reason the opens were dropped had
+    been overwritten by the very pass reacting to it. Best-effort: diagnostics must never break
+    the driver.
+    """
+    try:
+        with open(os.path.join(str(cdir), "report_pre_guard.json"), "w") as f:
+            json.dump(rep, f, indent=2)
+    except Exception:  # noqa: BLE001 — telemetry only
+        pass
+    try:
+        src = os.path.join(str(cdir), "proposals.json")
+        if os.path.exists(src):
+            with open(src) as f:
+                plan = json.load(f)
+            with open(os.path.join(str(cdir), "proposals_pre_guard.json"), "w") as f:
+                json.dump(plan, f, indent=2)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def _check_monthly_review() -> bool:
     """Run the blended-score parameter review if it is due. True if it ran."""
     review_dir = os.path.join(ROOT, "state", "monthly_review")
@@ -323,6 +349,8 @@ def main() -> int:
 
     # POST-GATE NEUTRALITY GUARD: a rotation into an asymmetric held book can leave it imbalanced.
     if abs(e["tilt"]) > 0.03 or e["n_long"] != e["n_short"]:
+        # snapshot FIRST — the guard's own gate pass overwrites report.json/proposals.json
+        _snapshot_pre_guard(cdir, rep)
         gl, gs = e["gross_long"], e["gross_short"]
         big = "short" if gs > gl else "long"
         frac = round(abs(gs - gl) / max(gs, gl, 1e-9), 4)
