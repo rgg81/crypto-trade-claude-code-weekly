@@ -52,13 +52,30 @@ def test_the_live_cy295_positions_would_have_signalled(tmp_path, monkeypatch):
     assert _exit_code(longs, shorts) == _EXIT_FLAT
 
 
-def test_the_signal_does_not_depend_on_which_path_noticed():
-    """DUE, SKIP and HOLD-ON-DATA-OUTAGE all report the same book, so they must agree. A naked
-    book persists across the ~8 SKIP ticks between 4h candles and across a multi-tick Binance ban;
-    signalling only on the DUE tick would go quiet for hours while the violation stands."""
+def test_no_path_in_main_can_hardcode_a_success_exit():
+    """The invariant, stated totally — every exit from `main` routes through `_exit_code`.
+
+    My first version of this test asserted `src.count("_exit_code(longs, shorts)") == 3` and looked
+    for bare `return 0` only in the slice before `cdir =`. It passed while FIVE
+    HOLD-ON-DATA-OUTAGE paths further down still returned 0, and cy296 duly held an L3/S0 book
+    through a Binance ban and reported success. Counting occurrences pins a number; this pins the
+    property, so a newly added early-return cannot slip past it.
+    """
     import inspect
     src = inspect.getsource(auto_cycle.main)
-    assert src.count("_exit_code(longs, shorts)") == 3, (
-        "every exit that reports a book must route through _exit_code")
-    assert "return 0" not in src.split("def main")[-1].split("cdir =")[0], (
-        "an early book-reporting path still hardcodes a success exit")
+    assert "return 0" not in src, (
+        "a path in main() hardcodes a success exit instead of reporting the book")
+    assert src.count("return _exit_code(longs, shorts)") == 8
+
+
+def test_every_hold_path_reports_the_book_it_is_holding():
+    """A hold that does not name the book cannot have judged it — three of them printed no book
+    at all, so their exit code could only ever have been a guess."""
+    import inspect
+    src = inspect.getsource(auto_cycle.main)
+    holds = [b for b in src.split("HOLD-ON-DATA-OUTAGE")[1:]]
+    assert len(holds) == 6, f"expected 6 hold paths, found {len(holds)}"
+    for i, block in enumerate(holds):
+        head = block[:block.index("return _exit_code")]
+        assert "vs SHORT" in head or "{book}" in head, (
+            f"hold path {i} exits without reporting the book it held")

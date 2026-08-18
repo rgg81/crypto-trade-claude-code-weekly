@@ -326,11 +326,15 @@ def main() -> int:
         print(f"HOLD-ON-DATA-OUTAGE cycle {cycle}: Binance -1003 ban still active for "
               f"~{rem // 60000}m — skipping scout to let it lapse (no fetch = no re-extend), book "
               f"held. {book}")
-        return 0
+        return _exit_code(longs, shorts)
 
     # A DATA OUTAGE (Binance rate-limit 418/-1003, network) makes scout/preflight produce no file.
-    # That is transient, not a code bug: HOLD the book and retry next tick (exit 0 so the cron does
-    # NOT flag it for investigation), never crash. The book is untouched — the gate has not run.
+    # That is transient, not a code bug: HOLD the book and retry next tick, never crash. The book
+    # is untouched — the gate has not run. The exit code reports the BOOK, not the outage: holding a
+    # balanced book exits 0 so the cron does not flag a transient fetch failure, but holding a NAKED
+    # one still exits _EXIT_FLAT. The violation does not stop being a violation because the tick
+    # that would have repaired it could not fetch prices — cy296 held an L3/S0 book through a ban
+    # and reported success.
     sc = run(["scripts/scout_cli.py", "--cycle", str(cycle), "--top", "12"])
     upath = os.path.join(cdir, "universe.json")
     if not os.path.exists(upath):
@@ -344,15 +348,18 @@ def main() -> int:
         print(f"HOLD-ON-DATA-OUTAGE cycle {cycle}: scout produced no universe (Binance "
               f"rate-limit/network){_bnote} — book held, retry next tick. {book} | "
               f"err: {sc.stderr.strip()[-160:]}")
-        return 0
+        return _exit_code(longs, shorts)
     uni = json.load(open(upath))
     uni_syms = [s["symbol"] for s in uni.get("universe", uni.get("candidates", []))]
     symbols = list(dict.fromkeys(uni_syms + _held_symbols()))  # union, order-preserving
     pf = run(["scripts/preflight.py", "--cycle", str(cycle), "--symbols", ",".join(symbols)])
     if not os.path.exists(os.path.join(cdir, "context.json")):
+        longs, shorts = _book()
         print(f"HOLD-ON-DATA-OUTAGE cycle {cycle}: preflight produced no context (rate-limit/"
-              f"network) — book held, retry next tick. err: {pf.stderr.strip()[-200:]}")
-        return 0
+              f"network) — book held, retry next tick. "
+              f"LONG {'/'.join(longs)} vs SHORT {'/'.join(shorts)} | "
+              f"err: {pf.stderr.strip()[-200:]}")
+        return _exit_code(longs, shorts)
 
     # deterministic news-neutral overlay (regime engine flags risk_off independently; blended engine
     # excludes pumps deterministically) -> satisfies the gate funnel + reclassify without any LLM.
@@ -365,9 +372,11 @@ def main() -> int:
 
     bb = run(["scripts/blended_book_cli.py", "--cycle", str(cycle)])
     if not os.path.exists(os.path.join(cdir, "proposals.json")):
+        longs, shorts = _book()
         print(f"HOLD-ON-DATA-OUTAGE cycle {cycle}: blended_book_cli produced no proposals — book "
-              f"held, retry next tick. err: {bb.stderr.strip()[-300:]}")
-        return 0
+              f"held, retry next tick. LONG {'/'.join(longs)} vs SHORT {'/'.join(shorts)} | "
+              f"err: {bb.stderr.strip()[-300:]}")
+        return _exit_code(longs, shorts)
     try:
         plan = json.loads(bb.stdout)["plan"]
         nrot = len(plan["close"]) + len(plan["open_long"]) + len(plan["open_short"])
@@ -380,9 +389,11 @@ def main() -> int:
 
     rep = _gate_exposure(cycle)
     if rep is None:
+        longs, shorts = _book()
         print(f"HOLD-ON-DATA-OUTAGE cycle {cycle}: gate produced no report (rate-limit/network "
-              f"mid-execute, or a parse issue) — book held, retry next tick.")
-        return 0
+              f"mid-execute, or a parse issue) — book held, retry next tick. "
+              f"LONG {'/'.join(longs)} vs SHORT {'/'.join(shorts)}")
+        return _exit_code(longs, shorts)
     e = rep["exposure"]
     print(f"gate: opened {rep['opened']} closed {rep['closed']} reduced {rep['reduced']} | "
           f"net ${e['net']:+.0f} tilt {e['tilt']:.4f} L{e['n_long']}/S{e['n_short']} "
