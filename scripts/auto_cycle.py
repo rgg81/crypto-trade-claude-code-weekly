@@ -89,6 +89,71 @@ def _book():
     return longs, shorts
 
 
+def _inception_equity() -> float | None:
+    """The FIRST equity ever logged — the desk's cost basis for lifetime PnL.
+
+    Read from state/equity-history.jsonl rather than hardcoded: reset_desk.py archives the history
+    and starts a new one, so a constant would keep reporting PnL against a desk that no longer
+    exists. Malformed lines are skipped, not fatal — this is a reporting nicety and must never take
+    down the driver.
+    """
+    p = os.path.join(ROOT, "state", "equity-history.jsonl")
+    if not os.path.exists(p):
+        return None
+    with open(p) as fh:
+        for line in fh:
+            try:
+                return float(json.loads(line)["equity"])
+            except Exception:  # noqa: BLE001, PERF203 — skip a corrupt line, keep looking
+                continue
+    return None
+
+
+def _last_logged() -> tuple[int | None, float | None]:
+    """(cycle, equity) of the most recent mark-to-market the desk actually recorded."""
+    p = os.path.join(ROOT, "state", "equity-history.jsonl")
+    if not os.path.exists(p):
+        return None, None
+    cyc = eq = None
+    with open(p) as fh:
+        for line in fh:
+            try:
+                d = json.loads(line)
+                cyc, eq = d.get("cycle"), float(d["equity"])
+            except Exception:  # noqa: BLE001, PERF203
+                continue
+    return cyc, eq
+
+
+def _pnl_line(equity: float | None = None) -> str:
+    """`PnL $+69.39 (+0.69%) | peak $10668.83 | dd 5.51%` — accumulated since inception.
+
+    `equity` is the LIVE mark from the gate on a DUE tick. Omit it and the line falls back to the
+    last logged equity, tagged `@cyN` — a SKIP cannot mark to market without a Binance fetch, and
+    the pacing bug came from quietly treating a stale last-logged equity as if it were current.
+    Returns "" (prints nothing) when there is no usable history, never a misleading zero.
+    """
+    base = _inception_equity()
+    if not base or base <= 0:
+        return ""
+    tag = ""
+    if equity is None:
+        cyc, equity = _last_logged()
+        if equity is None:
+            return ""
+        tag = f" @cy{cyc}" if cyc is not None else ""
+    pnl = equity - base
+    out = f"PnL ${pnl:+.2f} ({pnl / base:+.2%}){tag}"
+    try:
+        acct = json.load(open(os.path.join(ROOT, "state", "account.json")))
+        peak = float(acct.get("peak_equity") or 0.0)
+        if peak > 0:
+            out += f" | peak ${peak:.2f} | dd {max(0.0, (peak - equity) / peak):.2%}"
+    except Exception:  # noqa: BLE001 — PnL still prints without the peak/drawdown tail
+        pass
+    return out
+
+
 def _exit_code(longs, shorts) -> int:
     """HARD RULE 8. A naked sleeve is the mandate's one unbreakable violation, and until now it
     exited 0 — indistinguishable from a healthy tick to anything that does not read the text.
@@ -296,14 +361,14 @@ def main() -> int:
         longs, shorts = _book()
         print(f"HOLD-ON-DATA-OUTAGE: run_loops gave no verdict (rate-limit/network/lock) — book "
               f"held, retry next tick. LONG {'/'.join(longs)} vs SHORT {'/'.join(shorts)} | "
-              f"err: {rl.stderr.strip()[-200:]}")
+              f"{_pnl_line()} | err: {rl.stderr.strip()[-200:]}")
         return _exit_code(longs, shorts)   # holding a GOOD book is fine; a naked one still isn't
     cycle = st.get("cycle")
     if not st.get("due"):
         longs, shorts = _book()
         flat = not longs or not shorts
         print(f"SKIP cycle {cycle} | {'FLAT! (VIOLATION)' if flat else 'deployed'} | "
-              f"LONG {'/'.join(longs)} vs SHORT {'/'.join(shorts)}")
+              f"LONG {'/'.join(longs)} vs SHORT {'/'.join(shorts)} | {_pnl_line()}")
 
         # Monthly review check (optional, runs every ~30 days)
         _check_monthly_review()
@@ -325,7 +390,7 @@ def main() -> int:
         book = f"LONG {'/'.join(longs)} vs SHORT {'/'.join(shorts)}"
         print(f"HOLD-ON-DATA-OUTAGE cycle {cycle}: Binance -1003 ban still active for "
               f"~{rem // 60000}m — skipping scout to let it lapse (no fetch = no re-extend), book "
-              f"held. {book}")
+              f"held. {book} | {_pnl_line()}")
         return _exit_code(longs, shorts)
 
     # A DATA OUTAGE (Binance rate-limit 418/-1003, network) makes scout/preflight produce no file.
@@ -347,7 +412,7 @@ def main() -> int:
         _bnote = f" (ban until {_bu}, holding next fires until it lapses)" if _bu else ""
         print(f"HOLD-ON-DATA-OUTAGE cycle {cycle}: scout produced no universe (Binance "
               f"rate-limit/network){_bnote} — book held, retry next tick. {book} | "
-              f"err: {sc.stderr.strip()[-160:]}")
+              f"{_pnl_line()} | err: {sc.stderr.strip()[-160:]}")
         return _exit_code(longs, shorts)
     uni = json.load(open(upath))
     uni_syms = [s["symbol"] for s in uni.get("universe", uni.get("candidates", []))]
@@ -358,7 +423,7 @@ def main() -> int:
         print(f"HOLD-ON-DATA-OUTAGE cycle {cycle}: preflight produced no context (rate-limit/"
               f"network) — book held, retry next tick. "
               f"LONG {'/'.join(longs)} vs SHORT {'/'.join(shorts)} | "
-              f"err: {pf.stderr.strip()[-200:]}")
+              f"{_pnl_line()} | err: {pf.stderr.strip()[-200:]}")
         return _exit_code(longs, shorts)
 
     # deterministic news-neutral overlay (regime engine flags risk_off independently; blended engine
@@ -375,7 +440,7 @@ def main() -> int:
         longs, shorts = _book()
         print(f"HOLD-ON-DATA-OUTAGE cycle {cycle}: blended_book_cli produced no proposals — book "
               f"held, retry next tick. LONG {'/'.join(longs)} vs SHORT {'/'.join(shorts)} | "
-              f"err: {bb.stderr.strip()[-300:]}")
+              f"{_pnl_line()} | err: {bb.stderr.strip()[-300:]}")
         return _exit_code(longs, shorts)
     try:
         plan = json.loads(bb.stdout)["plan"]
@@ -392,7 +457,7 @@ def main() -> int:
         longs, shorts = _book()
         print(f"HOLD-ON-DATA-OUTAGE cycle {cycle}: gate produced no report (rate-limit/network "
               f"mid-execute, or a parse issue) — book held, retry next tick. "
-              f"LONG {'/'.join(longs)} vs SHORT {'/'.join(shorts)}")
+              f"LONG {'/'.join(longs)} vs SHORT {'/'.join(shorts)} | {_pnl_line()}")
         return _exit_code(longs, shorts)
     e = rep["exposure"]
     print(f"gate: opened {rep['opened']} closed {rep['closed']} reduced {rep['reduced']} | "
@@ -430,7 +495,8 @@ def main() -> int:
     longs, shorts = _book()
     flat = not longs or not shorts
     print(f"SUMMARY cycle {cycle} | {'FLAT! (VIOLATION)' if flat else 'deployed'} | "
-          f"LONG {'/'.join(longs)} vs SHORT {'/'.join(shorts)} | equity {rep['equity']:.2f}")
+          f"LONG {'/'.join(longs)} vs SHORT {'/'.join(shorts)} | equity {rep['equity']:.2f}"
+          f" | {_pnl_line(rep['equity'])}")
 
     # Monthly review check (optional, runs every ~30 days)
     _check_monthly_review()
