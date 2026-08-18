@@ -129,17 +129,49 @@ def presize_and_balance(props, *, equity, per_trade_risk_pct, held_long=0.0, hel
         return [(p, n * f) for p, n in l_legs], [(p, n * f) for p, n in s_legs]
 
     long_legs, short_legs = _fit_aggregate(long_legs, short_legs)
-    # drop legs the heat ceiling starves below the consolidate dust floor (the gate would size them
-    # to dust and consolidate would drop them SILENTLY — surface it here and exclude them upstream)
+
+    # Drop legs starved below the consolidate dust floor (the gate would size them to dust and
+    # consolidate would drop them SILENTLY — surface it here and exclude them upstream), but drop
+    # at most ONE per pass so the loop below can re-spread its budget over the survivors.
+    #
+    # Culling every starved leg at once emptied the whole sleeve at cy295 and executed a NAKED LONG
+    # book (L3/S0, 100% tilt — the mandate's one unbreakable invariant). Three shorts trimmed to the
+    # held long sleeve got $494.28 each against floors of $947.97 / $773.17 / $698.28, so all three
+    # failed together and there was nothing left to re-water-fill. The budget was never short: the
+    # same $1482.83 on ONE leg clears every one of those floors. Emptying a sleeve is not "shrinking
+    # risk" — it converts a dollar-neutral book into a one-sided directional bet, which is strictly
+    # MORE risk and the exact thing this module exists to prevent.
+    #
+    # Sacrifice the leg with the HIGHEST FLOOR — the most notional-hungry, i.e. the TIGHTEST stop,
+    # since dust_notional = dust_risk_frac * equity / stop_frac rises as the stop narrows. Removing
+    # it frees the most budget per leg sacrificed.
+    #
+    # NOT "largest shortfall". That ranks by floor MINUS allocation, and allocation is not uniform
+    # once any ceiling binds: `_waterfill` is max-min fair (equal share, capped), so a leg with a
+    # small ceiling shows a large shortfall however cheap its floor is. Shortfall-ranking therefore
+    # kills exactly the leg that could have survived alone — with held_long $490.90 and floors
+    # $367.49 / $531.45 / $681.33 it drops the $367.49 leg (the only affordable one) and empties the
+    # sleeve anyway, the very failure this loop exists to prevent.
+    #
+    # A leg the symmetric trim has ZEROED is not a candidate for sacrifice — it is already doomed
+    # (its side is at or past the balance point and can add nothing), so drop every one of them at
+    # once. Feeding them through one-at-a-time re-water-fills them to their full ceilings on each
+    # remaining pass, where they consume `aggregate_heat_headroom` in `_fit_aggregate` and scale the
+    # OTHER side's live legs down into the dust floor — strictly worse than the all-at-once cull
+    # this replaced. Their side keeps its held legs, so clearing them cannot empty a sleeve.
     def _viable(side_legs):
-        out = []
-        for p, n in side_legs:
-            if _is_dust(p, n):
-                heat_dropped.append(getattr(p, "symbol", "?"))
-            else:
-                out.append((p, n))
-        return out
-    long_legs, short_legs = _viable(long_legs), _viable(short_legs)
+        doomed = {i for i, (p, n) in enumerate(side_legs) if _is_dust(p, n) and n <= 1e-9}
+        if not doomed:
+            worst, highest = None, 0.0
+            for i, (p, n) in enumerate(side_legs):
+                floor = _dust_notional(p, equity, dust_risk_frac)
+                if _is_dust(p, n) and floor > highest:
+                    worst, highest = i, floor
+            if worst is None:
+                return side_legs
+            doomed = {worst}
+        heat_dropped.extend(getattr(side_legs[i][0], "symbol", "?") for i in sorted(doomed))
+        return [leg for i, leg in enumerate(side_legs) if i not in doomed]
 
     # SYMMETRIC TRIM so the realized finals balance: each side can only ADD what its viable legs can
     # deploy; trim the side that could add more to keep held_long+L_add == held_short+S_add. Only
@@ -166,7 +198,7 @@ def presize_and_balance(props, *, equity, per_trade_risk_pct, held_long=0.0, hel
     # risk = notional * stop_frac / equity, so the majors go under first. Re-check AFTER the trim,
     # and when a leg drops out re-water-fill the survivors so its budget is not stranded. Bounded:
     # each pass removes at least one leg, and it always converges to fewer legs, never more.
-    for _ in range(len(props) + 1):
+    for _ in range(len(props) + 2):     # +2, not +1: the old bound had zero slack
         t_long, t_short = _trim(long_legs, short_legs)
         v_long, v_short = _viable(t_long), _viable(t_short)
         if len(v_long) == len(t_long) and len(v_short) == len(t_short):
