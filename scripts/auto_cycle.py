@@ -73,8 +73,22 @@ def _capture_ban(state_dir, *texts) -> int | None:
     return None
 
 
-def _ban_remaining_ms(state_dir, now_ms: int | None = None) -> int:
-    """Milliseconds until the recorded ban lapses (0 if none / already lapsed -> safe to fetch)."""
+# QUIET PERIOD after a ban lapses. cy299 failed five fires running: each time the ban expired, the
+# very next fire fetched, and Binance re-banned within seconds (18:47->18:55->19:44->19:52). Volume
+# is not the cause — the desk makes ~60 requests a tick against a 2400/min limit, and 29 of the
+# previous 30 cycles completed on that same footprint. What repeats is firing into an IP carrying
+# escalated penalties at the instant the penalty expires. Waiting one more tick means the IP has
+# been quiet ~30 min instead of ~2. Shorter than the 30-min cadence, so it costs at most ONE extra
+# held fire and can never wedge the desk; the book is held either way.
+_BAN_COOLDOWN_MS = 10 * 60 * 1000
+
+
+def _ban_remaining_ms(state_dir, now_ms: int | None = None, cooldown_ms: int = 0) -> int:
+    """Milliseconds until it is safe to fetch again (0 -> go).
+
+    `cooldown_ms` extends the recorded deadline by a quiet period; see _BAN_COOLDOWN_MS. Defaults
+    to 0 so the raw ban semantics are unchanged for every other caller.
+    """
     p = _ban_path(state_dir)
     if not os.path.exists(p):
         return 0
@@ -84,7 +98,7 @@ def _ban_remaining_ms(state_dir, now_ms: int | None = None) -> int:
         return 0
     if now_ms is None:
         now_ms = int(time.time() * 1000)
-    return max(0, deadline - now_ms)
+    return max(0, deadline + max(0, cooldown_ms) - now_ms)
 
 
 def run(args, **kw):
@@ -409,13 +423,17 @@ def main() -> int:
     # the exchange — any fetch now would only re-extend the ban ~22min and it would never lapse
     # (observed cy190: the ban ratcheted ahead of real time across rapid fires). Wait it out; the
     # next fire landing after the deadline fetches cleanly. The 4h candle is still there to execute.
-    rem = _ban_remaining_ms(_state)
+    rem = _ban_remaining_ms(_state, cooldown_ms=_BAN_COOLDOWN_MS)
     if rem > 0:
+        raw = _ban_remaining_ms(_state)          # 0 once the ban itself has lapsed
+        why = (f"Binance -1003 ban still active for ~{raw // 60000}m — skipping scout to let it "
+               f"lapse (no fetch = no re-extend)"
+               if raw > 0 else
+               f"ban lapsed; holding a further ~{rem // 60000}m quiet period before fetching "
+               f"(firing the instant a ban expires just re-bans us)")
         longs, shorts = _book()
         book = f"LONG {'/'.join(longs)} vs SHORT {'/'.join(shorts)}"
-        print(f"HOLD-ON-DATA-OUTAGE cycle {cycle}: Binance -1003 ban still active for "
-              f"~{rem // 60000}m — skipping scout to let it lapse (no fetch = no re-extend), book "
-              f"held. {book} | {_pnl_line()}")
+        print(f"HOLD-ON-DATA-OUTAGE cycle {cycle}: {why}, book held. {book} | {_pnl_line()}")
         return _exit_code(longs, shorts)
 
     # A DATA OUTAGE (Binance rate-limit 418/-1003, network) makes scout/preflight produce no file.
