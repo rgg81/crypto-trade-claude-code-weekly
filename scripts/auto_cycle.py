@@ -89,6 +89,16 @@ def _book():
     return longs, shorts
 
 
+def _exit_code(longs, shorts) -> int:
+    """HARD RULE 8. A naked sleeve is the mandate's one unbreakable violation, and until now it
+    exited 0 — indistinguishable from a healthy tick to anything that does not read the text.
+    cy295 ran L3/S0 and the only alarm was a printed word. Exit non-zero so the 30-min cadence
+    surfaces it mechanically. Distinct from 1 (crash/traceback): the book is intact and held, it
+    is simply one-sided. A HOLD-ON-DATA-OUTAGE still exits 0 — holding a good book is not a
+    violation."""
+    return _EXIT_FLAT if (not longs or not shorts) else 0
+
+
 def _gate_exposure(cycle: int):
     """Run the gate ONCE and return its parsed report dict (or None)."""
     r = run(["scripts/gate_execute_cli.py", "--cycle", str(cycle), "--loop", "strategic"])
@@ -192,6 +202,7 @@ def _review_summary_line(report: dict) -> str:
 # n_per_side=3 needs |3-2|/3 = 0.333, so the routine case still corrects fully; the cap only bites
 # when more than one leg is gone — the runaway that took cy291 to 0.11x deployment.
 _GUARD_TRIM_CAP = 0.35
+_EXIT_FLAT = 2      # naked-sleeve mandate violation (not a crash)
 
 
 def _guard_trim(gross_long: float, gross_short: float,
@@ -286,18 +297,19 @@ def main() -> int:
         print(f"HOLD-ON-DATA-OUTAGE: run_loops gave no verdict (rate-limit/network/lock) — book "
               f"held, retry next tick. LONG {'/'.join(longs)} vs SHORT {'/'.join(shorts)} | "
               f"err: {rl.stderr.strip()[-200:]}")
-        return 0
+        return _exit_code(longs, shorts)   # holding a GOOD book is fine; a naked one still isn't
     cycle = st.get("cycle")
     if not st.get("due"):
         longs, shorts = _book()
         flat = not longs or not shorts
-        print(f"SKIP cycle {cycle} | {'FLAT!' if flat else 'deployed'} | "
+        print(f"SKIP cycle {cycle} | {'FLAT! (VIOLATION)' if flat else 'deployed'} | "
               f"LONG {'/'.join(longs)} vs SHORT {'/'.join(shorts)}")
 
         # Monthly review check (optional, runs every ~30 days)
         _check_monthly_review()
 
-        return 0
+        # a naked book stays naked across the ~8 SKIP ticks between candles — keep signalling it
+        return _exit_code(longs, shorts)
 
     cdir = os.path.join(ROOT, "state", "cycle", str(cycle))
     print(f"DUE cycle {cycle}: running deterministic blended tick")
@@ -412,7 +424,7 @@ def main() -> int:
     # Monthly review check (optional, runs every ~30 days)
     _check_monthly_review()
 
-    return 0
+    return _exit_code(longs, shorts)
 
 
 if __name__ == "__main__":

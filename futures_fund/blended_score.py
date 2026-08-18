@@ -239,7 +239,28 @@ def deployment_resizes(holdings: dict[str, str], notional_by_sym: dict[str, floa
             return set()
     elif any(len(sides[d]) > n_per_side for d in ("long", "short")):
         return set()                              # over-full side: not a deployment question
-    present = [sum(_ceil(s) for s in legs) for legs in sides.values() if legs]
+    # ACHIEVABLE GROSS PER SIDE. A side's ceiling sum only describes the slots it currently holds,
+    # but the plan-aware path below measures everything else per SLOT (book / n_per_side). Leaving
+    # `book` kept-based makes a mid-rotation side collapse it: at cy295 the short sleeve held one
+    # leg (XRP, ceiling $1745.57) with two rotating in, so book pinned at $1745.57 instead of the
+    # long sleeve's true ~$2492, the band test read the frozen $1481.85 long sleeve as "85% of
+    # target — no churn", and the sleeve stayed at 0.147x indefinitely. `neutral_book`'s symmetric
+    # trim then starved the incoming shorts into the dust floor: the upstream cause of the cy295
+    # FLAT violation.
+    #
+    # Scale a partial side to n_per_side slots at its kept legs' AVERAGE ceiling — measured from
+    # the legs actually present rather than assumed. `book` stays capped by equity/2 AND by the
+    # opposite side, so this can never size the desk above 1x gross or beyond what the weaker side
+    # supports; it only stops a rotation from pretending the book is smaller than it is.
+    present = []
+    for _d, _legs in sides.items():
+        if not _legs:
+            continue
+        _csum = sum(_ceil(s) for s in _legs)
+        if planned_opens_by_side is not None:
+            _slots = min(n_per_side, len(_legs) + planned_opens_by_side.get(_d, 0))
+            _csum = _csum / len(_legs) * _slots
+        present.append(_csum)
     book = min([equity / 2.0, *present]) if present else 0.0
     if book <= 0:
         return set()
