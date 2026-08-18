@@ -52,6 +52,27 @@ def _record_ban(state_dir, banned_until_ms: int) -> None:
         pass
 
 
+def _capture_ban(state_dir, *texts) -> int | None:
+    """Persist a -1003 ban deadline found in ANY subprocess output, and return it.
+
+    Every path that shells out to a Binance-touching script can come back with a 418
+    `banned until <epoch_ms>`, but `_record_ban` was wired to the scout path alone. At cy299 the
+    ban surfaced from PREFLIGHT: the book was held correctly, yet ban.json kept a stale, long
+    lapsed deadline (07:26 while the real ban ran to 18:47). `_ban_remaining_ms` therefore read 0,
+    the next fire fetched, and the ban re-extended ~22min — exactly the ratchet the guard exists to
+    stop, running unguarded through five of the six hold paths.
+
+    A 429 burst limit carries no deadline and is correctly ignored: there is nothing to wait out,
+    and inventing a ban would make the next fire skip its scout for no reason.
+    """
+    for t in texts:
+        bu = _parse_ban_until_ms(t or "")
+        if bu:
+            _record_ban(state_dir, bu)
+            return bu
+    return None
+
+
 def _ban_remaining_ms(state_dir, now_ms: int | None = None) -> int:
     """Milliseconds until the recorded ban lapses (0 if none / already lapsed -> safe to fetch)."""
     p = _ban_path(state_dir)
@@ -174,6 +195,9 @@ def _gate_exposure(cycle: int):
     try:
         return json.loads(txt[i:])
     except Exception:  # noqa: BLE001
+        # the gate fetches prices mid-execute (cy297 died here on a 429) — a 418 surfacing now
+        # must still record its deadline, or the next fire re-extends it
+        _capture_ban(os.path.join(ROOT, "state"), r.stderr, r.stdout)
         print("GATE raw output:\n", txt[-1500:], r.stderr[-500:])
         return None
 
@@ -354,11 +378,13 @@ def _check_monthly_review() -> bool:
 
 
 def main() -> int:
+    _state = os.path.join(ROOT, "state")
     rl = run(["scripts/run_loops.py"])
     try:
         st = json.loads(rl.stdout)["strategic"]
     except Exception:  # noqa: BLE001 — data outage / lock contention -> hold the book, retry next
         longs, shorts = _book()
+        _capture_ban(_state, rl.stderr, rl.stdout)
         print(f"HOLD-ON-DATA-OUTAGE: run_loops gave no verdict (rate-limit/network/lock) — book "
               f"held, retry next tick. LONG {'/'.join(longs)} vs SHORT {'/'.join(shorts)} | "
               f"{_pnl_line()} | err: {rl.stderr.strip()[-200:]}")
@@ -383,7 +409,6 @@ def main() -> int:
     # the exchange — any fetch now would only re-extend the ban ~22min and it would never lapse
     # (observed cy190: the ban ratcheted ahead of real time across rapid fires). Wait it out; the
     # next fire landing after the deadline fetches cleanly. The 4h candle is still there to execute.
-    _state = os.path.join(ROOT, "state")
     rem = _ban_remaining_ms(_state)
     if rem > 0:
         longs, shorts = _book()
@@ -404,9 +429,7 @@ def main() -> int:
     upath = os.path.join(cdir, "universe.json")
     if not os.path.exists(upath):
         # record any -1003 ban deadline so the NEXT fire holds before fetching (self-heal)
-        _bu = _parse_ban_until_ms(sc.stderr) or _parse_ban_until_ms(sc.stdout)
-        if _bu:
-            _record_ban(_state, _bu)
+        _bu = _capture_ban(_state, sc.stderr, sc.stdout)
         longs, shorts = _book()
         book = f"LONG {'/'.join(longs)} vs SHORT {'/'.join(shorts)}"
         _bnote = f" (ban until {_bu}, holding next fires until it lapses)" if _bu else ""
@@ -419,9 +442,11 @@ def main() -> int:
     symbols = list(dict.fromkeys(uni_syms + _held_symbols()))  # union, order-preserving
     pf = run(["scripts/preflight.py", "--cycle", str(cycle), "--symbols", ",".join(symbols)])
     if not os.path.exists(os.path.join(cdir, "context.json")):
+        _bu = _capture_ban(_state, pf.stderr, pf.stdout)
         longs, shorts = _book()
+        _bnote = f" (ban until {_bu}, holding next fires until it lapses)" if _bu else ""
         print(f"HOLD-ON-DATA-OUTAGE cycle {cycle}: preflight produced no context (rate-limit/"
-              f"network) — book held, retry next tick. "
+              f"network){_bnote} — book held, retry next tick. "
               f"LONG {'/'.join(longs)} vs SHORT {'/'.join(shorts)} | "
               f"{_pnl_line()} | err: {pf.stderr.strip()[-200:]}")
         return _exit_code(longs, shorts)
@@ -437,6 +462,7 @@ def main() -> int:
 
     bb = run(["scripts/blended_book_cli.py", "--cycle", str(cycle)])
     if not os.path.exists(os.path.join(cdir, "proposals.json")):
+        _capture_ban(_state, bb.stderr, bb.stdout)
         longs, shorts = _book()
         print(f"HOLD-ON-DATA-OUTAGE cycle {cycle}: blended_book_cli produced no proposals — book "
               f"held, retry next tick. LONG {'/'.join(longs)} vs SHORT {'/'.join(shorts)} | "
