@@ -102,5 +102,8 @@ def test_every_tick_reports_pnl():
     import inspect
     src = inspect.getsource(auto_cycle.main)
     assert src.count("_pnl_line()") == 7, "a hold/skip path prints a book without PnL"
-    assert src.count("_pnl_line(rep['equity'])") == 1, "the DUE summary must use the LIVE mark"
+    # The DUE summary uses the LIVE mark — and specifically the POST-guard one, since the guard's
+    # second gate pass re-marks the book (see test_reported_equity_post_guard.py).
+    assert "_pnl_line(_reported_equity(rep, rep2))" in src
+    assert "_pnl_line(rep['equity'])" not in src, "the stale pre-guard equity must not be reported"
     assert src.count("_pnl_line") == src.count("return _exit_code(longs, shorts)")

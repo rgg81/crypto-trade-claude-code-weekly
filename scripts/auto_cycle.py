@@ -227,6 +227,23 @@ def _pnl_line(equity: float | None = None) -> str:
     return out
 
 
+def _reported_equity(rep, rep2=None) -> float:
+    """Equity of the book that ACTUALLY stands at the end of the tick.
+
+    The neutrality guard runs a SECOND gate pass — it closes part of the oversized sleeve, pays the
+    fees and re-marks the book — so the pre-guard `rep` is one pass stale whenever the guard fires.
+    cy305 printed $10149.71 while the standing book reconciled to $10196.73 (balance $10198.45 plus
+    $-1.72 unrealized): a $47.02 error that flowed straight into the PnL line and understated it by
+    the same amount. `rep2` was already being computed and thrown away after one progress line.
+
+    Falls back to `rep` when the guard did not run, or when its gate pass returned nothing (a
+    rate-limit mid-execute) — the summary must always print.
+    """
+    if rep2 and rep2.get("equity") is not None:
+        return float(rep2["equity"])
+    return float(rep["equity"])
+
+
 def _exit_code(longs, shorts) -> int:
     """HARD RULE 8. A naked sleeve is the mandate's one unbreakable violation, and until now it
     exited 0 — indistinguishable from a healthy tick to anything that does not read the text.
@@ -549,6 +566,7 @@ def main() -> int:
           f"equity {rep['equity']:.2f} halt {rep['halted']}")
 
     # POST-GATE NEUTRALITY GUARD: a rotation into an asymmetric held book can leave it imbalanced.
+    rep2 = None
     if abs(e["tilt"]) > 0.03 or e["n_long"] != e["n_short"]:
         # snapshot FIRST — the guard's own gate pass overwrites report.json/proposals.json
         _snapshot_pre_guard(cdir, rep)
@@ -579,8 +597,9 @@ def main() -> int:
     longs, shorts = _book()
     flat = not longs or not shorts
     print(f"SUMMARY cycle {cycle} | {'FLAT! (VIOLATION)' if flat else 'deployed'} | "
-          f"LONG {'/'.join(longs)} vs SHORT {'/'.join(shorts)} | equity {rep['equity']:.2f}"
-          f" | {_pnl_line(rep['equity'])}")
+          f"LONG {'/'.join(longs)} vs SHORT {'/'.join(shorts)} | "
+          f"equity {_reported_equity(rep, rep2):.2f}"
+          f" | {_pnl_line(_reported_equity(rep, rep2))}")
 
     # Monthly review check (optional, runs every ~30 days)
     _check_monthly_review()
