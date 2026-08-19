@@ -89,10 +89,17 @@ def test_a_long_lapsed_ban_does_not_hold(tmp_path):
                              cooldown_ms=_BAN_COOLDOWN_MS) == 0
 
 
-def test_the_guard_applies_the_cooldown():
-    """Wiring: the hold check in main() must pass the cooldown, or none of this takes effect."""
+def test_the_guard_applies_a_cooldown():
+    """Wiring: the hold check in main() must pass a cooldown, or none of this takes effect.
+
+    Superseded by the exponential backoff (test_ban_backoff.py): the guard now passes
+    `_ban_cooldown_ms(_consecutive_bans(...))`, which EQUALS _BAN_COOLDOWN_MS for a first ban, so
+    the behaviour this module pins is unchanged for the one-off case it was written for.
+    """
     import inspect
 
     from scripts import auto_cycle
+    from scripts.auto_cycle import _ban_cooldown_ms
     src = inspect.getsource(auto_cycle.main)
-    assert "_ban_remaining_ms(_state, cooldown_ms=_BAN_COOLDOWN_MS)" in src
+    assert "_ban_remaining_ms(_state, cooldown_ms=_ban_cooldown_ms(" in src
+    assert _ban_cooldown_ms(1) == _BAN_COOLDOWN_MS

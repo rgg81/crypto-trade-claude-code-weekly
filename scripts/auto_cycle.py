@@ -47,7 +47,8 @@ def _record_ban(state_dir, banned_until_ms: int) -> None:
         if os.path.exists(p):
             prev = int(json.load(open(p)).get("banned_until_ms", 0))
         deadline = max(prev, int(banned_until_ms))
-        json.dump({"banned_until_ms": deadline}, open(p, "w"))
+        json.dump({"banned_until_ms": deadline,
+                   "consecutive": _consecutive_bans(state_dir) + 1}, open(p, "w"))
     except Exception:  # noqa: BLE001 — telemetry only; never break the driver
         pass
 
@@ -81,6 +82,43 @@ def _capture_ban(state_dir, *texts) -> int | None:
 # been quiet ~30 min instead of ~2. Shorter than the 30-min cadence, so it costs at most ONE extra
 # held fire and can never wedge the desk; the book is held either way.
 _BAN_COOLDOWN_MS = 10 * 60 * 1000
+# ...and DOUBLE it per consecutive ban. The fixed cooldown above was built on the wrong diagnosis:
+# cy301 waited 29 minutes in total silence and the very first fetch_tickers still drew a 418, so
+# "we fire too soon after expiry" does not explain it. What the data does show is ESCALATION —
+# banned ~8m, then ~34m — because Binance penalises repeat -1003 offenders and every fire that
+# draws a 418 is itself another violation. A fixed 30-minute retry therefore feeds the escalation
+# it is waiting out. Volume is not the lever (~60 requests a tick against a 2400/min limit), so
+# how OFTEN we knock is the only one left.
+#
+# Capped at one 4h candle: backing off never touches the book — positions stay open and
+# dollar-neutral throughout, the desk just stops ROTATING until the IP clears. That costs edge,
+# not safety, and the cap guarantees it resumes on its own.
+_BAN_BACKOFF_CAP_MS = 4 * 60 * 60 * 1000
+
+
+def _consecutive_bans(state_dir) -> int:
+    """How many bans in a row without a successful fetch in between (0 if none / unreadable)."""
+    try:
+        n = int(json.load(open(_ban_path(state_dir))).get("consecutive", 0))
+        return max(0, n)
+    except Exception:  # noqa: BLE001 — a corrupt counter must degrade to the base cooldown
+        return 0
+
+
+def _ban_cooldown_ms(consecutive: int) -> int:
+    """Quiet period after the deadline: base, doubling per consecutive ban, capped."""
+    return min(_BAN_BACKOFF_CAP_MS, _BAN_COOLDOWN_MS * 2 ** max(0, consecutive - 1))
+
+
+def _clear_ban(state_dir) -> None:
+    """A successful fetch ends the streak — otherwise one bad night backs the desk off forever."""
+    try:
+        p = _ban_path(state_dir)
+        if os.path.exists(p):
+            os.remove(p)
+    except Exception:  # noqa: BLE001 — best effort; never break the cycle
+        pass
+
 
 
 def _ban_remaining_ms(state_dir, now_ms: int | None = None, cooldown_ms: int = 0) -> int:
@@ -423,14 +461,15 @@ def main() -> int:
     # the exchange — any fetch now would only re-extend the ban ~22min and it would never lapse
     # (observed cy190: the ban ratcheted ahead of real time across rapid fires). Wait it out; the
     # next fire landing after the deadline fetches cleanly. The 4h candle is still there to execute.
-    rem = _ban_remaining_ms(_state, cooldown_ms=_BAN_COOLDOWN_MS)
+    rem = _ban_remaining_ms(_state, cooldown_ms=_ban_cooldown_ms(_consecutive_bans(_state)))
     if rem > 0:
         raw = _ban_remaining_ms(_state)          # 0 once the ban itself has lapsed
         why = (f"Binance -1003 ban still active for ~{raw // 60000}m — skipping scout to let it "
                f"lapse (no fetch = no re-extend)"
                if raw > 0 else
                f"ban lapsed; holding a further ~{rem // 60000}m quiet period before fetching "
-               f"(firing the instant a ban expires just re-bans us)")
+               f"after {_consecutive_bans(_state)} consecutive bans "
+               f"(each retry that draws a 418 extends the next ban)")
         longs, shorts = _book()
         book = f"LONG {'/'.join(longs)} vs SHORT {'/'.join(shorts)}"
         print(f"HOLD-ON-DATA-OUTAGE cycle {cycle}: {why}, book held. {book} | {_pnl_line()}")
@@ -455,6 +494,7 @@ def main() -> int:
               f"rate-limit/network){_bnote} — book held, retry next tick. {book} | "
               f"{_pnl_line()} | err: {sc.stderr.strip()[-160:]}")
         return _exit_code(longs, shorts)
+    _clear_ban(_state)          # scout fetched cleanly -> the IP is good, reset the backoff
     uni = json.load(open(upath))
     uni_syms = [s["symbol"] for s in uni.get("universe", uni.get("candidates", []))]
     symbols = list(dict.fromkeys(uni_syms + _held_symbols()))  # union, order-preserving
