@@ -22,8 +22,11 @@ def _raw(sym: str) -> str:
     return sym.split("/")[0] + "USDT" if "/" in sym else sym
 
 
+_ATR_MULT = 2.0          # the stop is ATR x this; _structure and the openable filter must agree
+
+
 def _structure(brief: dict, direction: str, *, rr1: float = 2.2, rr2: float = 3.5,
-               atr_mult: float = 2.0) -> dict:
+               atr_mult: float = _ATR_MULT) -> dict:
     entry = float(brief["last_close"])
     atr = float(brief["atr"])
     risk = atr_mult * atr
@@ -70,6 +73,19 @@ def main() -> None:
         uni = json.load(open(upath))
         uni_syms = [_raw(s["symbol"]) for s in uni.get("universe", uni.get("candidates", []))]
         openable = set(uni_syms) | set(holdings)
+
+    # UN-OPENABLE WIDE STOPS: a name whose ATR stop exceeds the gate's liq-distance ceiling is
+    # vetoed every single time, and the sleeve executes a leg short. BTWUSDT did exactly that at
+    # cy305 (long, 43.45% stop -> L2/S3) and cy307 (short, 41.90% -> L3/S2). Drop it from the
+    # candidates so the slot goes to the next-ranked name that CAN open. Held names are filtered
+    # too: an unopenable holding can still be kept or closed, it just never gets re-opened.
+    _ceiling = bs.admissible_stop_frac(None)          # stricter of long/short, direction-agnostic
+    _too_wide = {b["symbol"] for b in briefs
+                 if b.get("atr") and b.get("last_close")
+                 and _ATR_MULT * float(b["atr"]) / float(b["last_close"]) > _ceiling}
+    if _too_wide:
+        openable = (openable if openable is not None
+                    else {b["symbol"] for b in briefs}) - _too_wide
 
     scored = bs.composite_scores(briefs)
     weights = scored[0]["weights"] if scored else {}

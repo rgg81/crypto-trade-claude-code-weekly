@@ -430,3 +430,43 @@ def apply_hysteresis(scored: list[dict], holdings: dict[str, str], n_per_side: i
             close.append(s)
     return {"keep_long": keep_long, "keep_short": keep_short,
             "open_long": open_long, "open_short": open_short, "close": close}
+
+
+def admissible_stop_frac(direction: str | None, *, leverage: float = 1.0) -> float:
+    """Widest stop (as a fraction of entry) the GATE can still accept for this direction.
+
+    `risk_gate.MIN_LIQ_DISTANCE_MULT` requires the liquidation price to sit at least 2.5 stop
+    distances from entry, so
+
+        max stop fraction = liq_distance_fraction / MIN_LIQ_DISTANCE_MULT
+
+    At the desk's 1x cap that is 40.000% for a long (liq 100% away) and 36.190% for a short (liq
+    90.48% away, because a short liquidates nearer at equal leverage).
+
+    A name whose ATR stop exceeds this is structurally un-openable — not marginal, not
+    size-dependent, never admissible at any risk_mult. BTWUSDT was ranked into a sleeve at cy305
+    (long, 43.45%) and cy307 (short, 41.90%); the gate vetoed it both times and the book executed a
+    leg short, L2/S3 then L3/S2. The pre-sizer passed it through untouched, so nothing upstream
+    noticed the slot was simply lost.
+
+    DERIVED, never hardcoded: the constant and the liquidation maths come from the gate itself, so
+    if the gate tightens this tightens with it. Selection-layer only — it can shrink the candidate
+    set, never widen what the gate will accept.
+    """
+    from futures_fund.exchange import default_symbol_spec
+    from futures_fund.liquidation import liquidation_price, mmr_for_notional
+    from futures_fund.risk_gate import MIN_LIQ_DISTANCE_MULT
+
+    entry, qty = 100.0, 1.0
+    notional = entry * qty
+    spec = default_symbol_spec({"id": "XUSDT", "symbol": "X/USDT:USDT",
+                                "precision": {"price": 8, "amount": 8},
+                                "limits": {"cost": {"min": 5.0}, "amount": {"min": 1e-8}}})
+    mmr, maint = mmr_for_notional(notional, spec.mmr_brackets)
+    d = (direction or "").lower()
+    dirs = (d,) if d in ("long", "short") else ("long", "short")   # unknown -> stricter of the two
+    out = []
+    for dd in dirs:
+        liq = liquidation_price(entry, qty, notional / max(leverage, 1e-9), dd, mmr, maint)
+        out.append(abs(entry - liq) / entry / MIN_LIQ_DISTANCE_MULT)
+    return min(out)
