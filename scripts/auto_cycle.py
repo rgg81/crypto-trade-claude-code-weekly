@@ -359,8 +359,24 @@ def _review_summary_line(report: dict) -> str:
 # Max fraction the neutrality guard may trim off a sleeve in ONE pass. One missing leg out of
 # n_per_side=3 needs |3-2|/3 = 0.333, so the routine case still corrects fully; the cap only bites
 # when more than one leg is gone — the runaway that took cy291 to 0.11x deployment.
+_GUARD_TILT_BAND = 0.03     # trim only when the DOLLARS are out of band
 _GUARD_TRIM_CAP = 0.35
 _EXIT_FLAT = 2      # naked-sleeve mandate violation (not a crash)
+
+
+def _guard_should_trim(exposure) -> bool:
+    """Trim only when the DOLLARS are out of band — never on a leg-count mismatch alone.
+
+    Trimming moves dollars; it cannot add the missing leg that caused a count imbalance. On an
+    already-neutral book it just pays fees, and it can make neutrality worse. cy319 (only 3 names
+    cleared the pump filter, so the book was L1/S2 but balanced at tilt 0.0009) trimmed the long
+    sleeve 0.18% and pushed tilt to 0.0011 — 33x inside the band, corrected in the wrong direction.
+
+    An imbalance that also skews the dollars still trips the tilt test, so nothing that mattered is
+    lost. The count mismatch stays surfaced for the operator (HARD RULE 8); it just no longer
+    triggers a pointless round-trip. A short-handed side is refilled by the next cycle's plan.
+    """
+    return abs(float(exposure.get("tilt") or 0.0)) > _GUARD_TILT_BAND
 
 
 def _guard_trim(gross_long: float, gross_short: float,
@@ -567,7 +583,11 @@ def main() -> int:
 
     # POST-GATE NEUTRALITY GUARD: a rotation into an asymmetric held book can leave it imbalanced.
     rep2 = None
-    if abs(e["tilt"]) > 0.03 or e["n_long"] != e["n_short"]:
+    if e["n_long"] != e["n_short"] and not _guard_should_trim(e):
+        print(f"  note: book is L{e['n_long']}/S{e['n_short']} but dollar-neutral "
+              f"(tilt {e['tilt']:.4f}) — a short-handed side needs a REFILL, not a trim; "
+              f"the next cycle's plan fills it.")
+    if _guard_should_trim(e):
         # snapshot FIRST — the guard's own gate pass overwrites report.json/proposals.json
         _snapshot_pre_guard(cdir, rep)
         gl, gs = e["gross_long"], e["gross_short"]
