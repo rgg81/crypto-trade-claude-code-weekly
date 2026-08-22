@@ -364,6 +364,28 @@ _GUARD_TRIM_CAP = 0.35
 _EXIT_FLAT = 2      # naked-sleeve mandate violation (not a crash)
 
 
+def _guard_outcome_line(rep2, tilt_before: float) -> str:
+    """What the guard's second gate pass actually achieved — success or failure, never silence.
+
+    The guard applies its trim by running the gate a SECOND time. When that pass dies (a rate-limit
+    mid-execute) the trim never reaches the book, but the old code printed the "trimming ... by X"
+    line, dumped a traceback, and went straight to a SUMMARY saying "deployed". At cy322 that read
+    as a completed correction while the book stayed at tilt 0.0532 against the 0.0523 the guard set
+    out to fix — out of the 0.03 band until the next DUE candle ~4h later.
+
+    The book is safe either way (still deployed, both sleeves populated), so this is a reporting
+    obligation rather than a risk one: an operator must be able to tell "guard trimmed" from "guard
+    tried and failed".
+    """
+    exp = (rep2 or {}).get("exposure") if isinstance(rep2, dict) else None
+    if not exp:
+        return (f"  GUARD PASS FAILED: the trim DID NOT LAND — the book is unchanged at tilt "
+                f"{tilt_before:.4f} and stays out of band until the next DUE cycle re-runs the "
+                f"guard. Book is still deployed; no position was left half-executed.")
+    return (f"  after guard: net ${exp['net']:+.0f} tilt {exp['tilt']:.4f} "
+            f"L{exp['n_long']}/S{exp['n_short']}")
+
+
 def _guard_should_trim(exposure) -> bool:
     """Trim only when the DOLLARS are out of band — never on a leg-count mismatch alone.
 
@@ -609,10 +631,7 @@ def main() -> int:
                   open(os.path.join(cdir, "proposals.json"), "w"), indent=2)
         print(f"NEUTRALITY GUARD: tilt {e['tilt']:.3f} -> trimming {big} sleeve by {frac}")
         rep2 = _gate_exposure(cycle)
-        if rep2:
-            e2 = rep2["exposure"]
-            print(f"  after guard: net ${e2['net']:+.0f} tilt {e2['tilt']:.4f} "
-                  f"L{e2['n_long']}/S{e2['n_short']}")
+        print(_guard_outcome_line(rep2, e["tilt"]))
 
     longs, shorts = _book()
     flat = not longs or not shorts
