@@ -364,6 +364,43 @@ _GUARD_TRIM_CAP = 0.35
 _EXIT_FLAT = 2      # naked-sleeve mandate violation (not a crash)
 
 
+def _veto_reasons(state_dir, cycle: int) -> str:
+    """The gate's veto REASONS for this cycle, read from the shadow ledger.
+
+    `cycle.py` records every veto with its reason (`record_shadow(...)`), but the report keeps only
+    an integer count and `drop_reasons` stays empty — so a tick prints "opened 0 closed 2" and the
+    operator cannot tell why two legs vanished.
+
+    cy325 made that expensive: both planned longs were vetoed, the long sleeve collapsed to one leg
+    and the book ended at tilt 0.4230 (~$1023 net short, 10% of equity). Finding the cause meant
+    reproducing the gate offline and ruling out the breaker, the period returns and the heat caps,
+    when the answer was already on disk — "no heat headroom (used 0.043 >= cap 0.040)": the book had
+    been sized at the healthy cap of 0.08, drawdown crossed 5%, and the caution cap of 0.04 put the
+    EXISTING book over budget.
+
+    `cycle.py` and `risk_gate.py` are PROTECTED, so this reads what they already write. Identical
+    reasons are grouped — a whole-sleeve veto is one cause, not N. Never fatal: a missing or corrupt
+    ledger yields "".
+    """
+    p = os.path.join(str(state_dir), "shadow-ledger.jsonl")
+    if not os.path.exists(p):
+        return ""
+    by_reason: dict[str, list[str]] = {}
+    try:
+        with open(p) as fh:
+            for line in fh:
+                try:
+                    d = json.loads(line)
+                except Exception:  # noqa: BLE001, PERF203 — skip a corrupt line
+                    continue
+                if d.get("cycle") != cycle or not d.get("reason"):
+                    continue
+                by_reason.setdefault(str(d["reason"]), []).append(str(d.get("symbol", "?")))
+    except Exception:  # noqa: BLE001 — telemetry only
+        return ""
+    return "".join(f"\n  VETOED {'/'.join(syms)}: {reason}" for reason, syms in by_reason.items())
+
+
 def _guard_outcome_line(rep2, tilt_before: float) -> str:
     """What the guard's second gate pass actually achieved — success or failure, never silence.
 
@@ -601,7 +638,8 @@ def main() -> int:
     e = rep["exposure"]
     print(f"gate: opened {rep['opened']} closed {rep['closed']} reduced {rep['reduced']} | "
           f"net ${e['net']:+.0f} tilt {e['tilt']:.4f} L{e['n_long']}/S{e['n_short']} "
-          f"equity {rep['equity']:.2f} halt {rep['halted']}")
+          f"equity {rep['equity']:.2f} halt {rep['halted']}"
+          f"{_veto_reasons(_state, cycle)}")
 
     # POST-GATE NEUTRALITY GUARD: a rotation into an asymmetric held book can leave it imbalanced.
     rep2 = None
