@@ -439,21 +439,33 @@ def _guard_should_trim(exposure) -> bool:
 
 
 def _guard_trim(gross_long: float, gross_short: float,
-                cap: float = _GUARD_TRIM_CAP) -> tuple[str, float, bool]:
+                cap: float = _GUARD_TRIM_CAP,
+                *, counts_balanced: bool = False) -> tuple[str, float, bool]:
     """(oversized side, trim fraction, was_capped) to bring the book back toward neutral.
 
     Trimming by the FULL gross difference is right for rotation asymmetry but wrong when a leg is
     missing: an L3/S1 book means trimming the long sleeve 83% to match one surviving short, which
     is not neutrality but liquidation — deployment went 0.85x -> 0.11x at cy290-291 and the book
     could not climb back out. Capping leaves residual tilt for one cycle, which the refill then
-    closes; bounded tilt beats an unbounded deployment collapse. The cap can only ever make the
-    guard shrink LESS, never more.
+    closes; bounded tilt beats an unbounded deployment collapse.
+
+    But a big required trim does NOT always mean a missing leg. `counts_balanced` says both sleeves
+    are FULL, and then there is nothing to wait for a refill to fix. cy326 was L3/S3 with every leg
+    at risk_mult = 1.0 — each long pinned at `ptr * equity / stop_frac` with stops three times wider
+    than the shorts', so the long sleeve maxed out at $502.41 against $1170.90 of shorts and could
+    not grow. Neutralising needed 70.4% off the shorts; the cap refused and left tilt 0.3981, a $669
+    net short (6.6% of equity) for a full 4h candle — twice running.
+
+    So cap only when the counts differ, which is the actual missing-leg signature. Trimming still
+    only ever SHRINKS, so a full trim cannot add risk: it costs deployment, and dollar-neutrality is
+    the mandate's hard invariant where deployment is not. Defaults to the capped behaviour so a
+    caller that cannot say stays conservative.
     """
     gl, gs = max(0.0, gross_long), max(0.0, gross_short)
     big = "short" if gs > gl else "long"
     denom = max(gl, gs, 1e-9)
     frac = abs(gs - gl) / denom
-    if frac <= cap:
+    if frac <= cap or counts_balanced:
         # FLOOR, never round-half: rounding up would trim MORE than the true difference, breaking
         # the "the guard may only ever shrink less" invariant.
         return big, math.floor(frac * 10000) / 10000, False
@@ -651,7 +663,8 @@ def main() -> int:
         # snapshot FIRST — the guard's own gate pass overwrites report.json/proposals.json
         _snapshot_pre_guard(cdir, rep)
         gl, gs = e["gross_long"], e["gross_short"]
-        big, frac, capped = _guard_trim(gl, gs)
+        big, frac, capped = _guard_trim(
+            gl, gs, counts_balanced=e["n_long"] == e["n_short"])
         if capped:
             print(f"  GUARD CAPPED: neutralising would need "
                   f"{abs(gs - gl) / max(gs, gl, 1e-9):.1%} off the {big} sleeve — that is a "
