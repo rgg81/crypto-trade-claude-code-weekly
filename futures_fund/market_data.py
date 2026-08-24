@@ -111,6 +111,25 @@ def scan_universe(client, top_n: int = 30) -> list[dict]:
     return rows[:top_n]
 
 
+def klines_to_ccxt_rows(raw: list[list]) -> list[list]:
+    """Binance raw klines -> the 6-field float rows ccxt's fetch_ohlcv returns.
+
+    The local binance-proxy (~/binance-proxy) mirrors Binance's `/fapi/v1/klines` byte-for-byte, so
+    it hands back the 12-field form with prices as STRINGS. ccxt normalises to
+    [ts_ms, open, high, low, close, volume] floats, which is what `parse_ohlcv` and everything
+    downstream expects — so convert here and nothing else changes.
+
+    A short or malformed row raises rather than being skipped: silently dropping a candle would
+    corrupt ATR and momentum with no signal at all.
+    """
+    out: list[list] = []
+    for r in raw:
+        if len(r) < 6:
+            raise ValueError(f"malformed kline row (need >=6 fields, got {len(r)}): {r!r}")
+        out.append([int(r[0]), float(r[1]), float(r[2]), float(r[3]), float(r[4]), float(r[5])])
+    return out
+
+
 def parse_ohlcv(rows: list[list]) -> pd.DataFrame:
     """ccxt OHLCV rows [[ts_ms,o,h,l,c,v], ...] -> sorted UTC-timestamped DataFrame."""
     df = pd.DataFrame(rows, columns=["ts", "open", "high", "low", "close", "volume"])

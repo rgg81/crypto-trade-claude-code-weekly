@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import json
+
 import pandas as pd
 
 from futures_fund.config import Settings
 from futures_fund.market_data import (
     FundingInfo,
     _filter_field,
+    klines_to_ccxt_rows,
     parse_funding,
     parse_long_short_ratio,
     parse_ohlcv,
@@ -60,11 +63,23 @@ def default_symbol_spec(market: dict) -> SymbolSpec:
     )
 
 
+def _proxy_get_klines(url: str, params: dict | None = None, timeout: float | None = None):
+    """GET the proxy's /fapi/v1/klines. Split out so tests can substitute it without a socket."""
+    import urllib.parse
+    import urllib.request
+
+    q = urllib.parse.urlencode(params or {})
+    with urllib.request.urlopen(f"{url}?{q}", timeout=timeout or 30) as r:  # noqa: S310
+        return json.loads(r.read().decode())
+
+
 class FuturesExchange:
     """Thin wrapper over a ccxt-like client. Inject a fake client in tests."""
 
-    def __init__(self, client, keyless: bool = False):
+    def __init__(self, client, keyless: bool = False, klines_proxy_url: str = ""):
         self.client = client
+        # When set, ALL candle fetches go through the local binance-proxy instead of Binance.
+        self.klines_proxy_url = (klines_proxy_url or "").rstrip("/")
         # keyless: leverage tiers (an authenticated endpoint) are unavailable, so symbol_spec
         # falls back to a conservative default bracket. True for paper; False for live.
         self.keyless = keyless
@@ -73,7 +88,8 @@ class FuturesExchange:
     def from_settings(cls, settings: Settings) -> FuturesExchange:
         ex = build_ccxt(settings)
         ex.load_markets()
-        return cls(ex, keyless=not settings.live)
+        return cls(ex, keyless=not settings.live,
+                   klines_proxy_url=settings.exchange.klines_proxy_url)
 
     def _raw_id(self, symbol: str) -> str:
         return self.client.market(symbol)["id"]
@@ -100,6 +116,19 @@ class FuturesExchange:
         return parse_symbol_spec(market, tiers)
 
     def ohlcv(self, symbol: str, timeframe: str = "4h", limit: int = 500) -> pd.DataFrame:
+        """Candles, via the local binance-proxy when one is configured.
+
+        NO SILENT FALLBACK. If the proxy is unreachable or its circuit breaker is open (503 +
+        Retry-After), this RAISES. Quietly resuming direct Binance calls is precisely the behaviour
+        that got the desk IP-banned, so it is forbidden; auto_cycle's HOLD-ON-DATA-OUTAGE path
+        already turns a raised fetch into a safely-held book.
+        """
+        if self.klines_proxy_url:
+            raw = _proxy_get_klines(
+                f"{self.klines_proxy_url}/fapi/v1/klines",
+                params={"symbol": self._raw_id(symbol), "interval": timeframe, "limit": limit},
+            )
+            return parse_ohlcv(klines_to_ccxt_rows(raw))
         return parse_ohlcv(self.client.fetch_ohlcv(symbol, timeframe, None, limit))
 
     def funding(self, symbol: str) -> FundingInfo:

@@ -11,6 +11,18 @@ class ExchangeSettings(BaseModel):
     testnet: bool = True
     key_env: str = "BINANCE_KEY"
     secret_env: str = "BINANCE_SECRET"
+    # KLINES PROXY (operator requirement, non-negotiable). Candles are the desk's heaviest call —
+    # preflight pulls ~14 series x 500 candles a tick — and they are what repeatedly tripped
+    # Binance's -1003 IP bans (cy299, cy301, cy306, cy310, cy325 all blocked on it). ~/binance-proxy
+    # mirrors /fapi/v1/klines byte-for-byte, caches closed candles in SQLite forever, coalesces
+    # concurrent identical requests into one upstream call, and throttles on Binance's own weight
+    # headers. Override with BINANCE_KLINES_PROXY; set it empty ONLY to disable in tests.
+    klines_proxy_env: str = "BINANCE_KLINES_PROXY"
+    klines_proxy_default: str = "http://127.0.0.1:8000"
+
+    @property
+    def klines_proxy_url(self) -> str:
+        return os.environ.get(self.klines_proxy_env, self.klines_proxy_default)
 
     @property
     def api_key(self) -> str | None:

@@ -19,6 +19,8 @@ import sys
 import time
 from datetime import datetime, timedelta
 
+from futures_fund.config import load_settings
+
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PY = [sys.executable]
 
@@ -364,6 +366,69 @@ _GUARD_TRIM_CAP = 0.35
 _EXIT_FLAT = 2      # naked-sleeve mandate violation (not a crash)
 
 
+_KLINES_WARM_LIMIT = 500          # matches FuturesExchange.ohlcv's default
+_MAX_AGE_INTERVALS = 2            # one for the forming candle, one for clock/publish slack
+
+
+def _interval_ms(timeframe: str) -> int:
+    """Binance interval string -> milliseconds."""
+    unit = timeframe[-1]
+    n = int(timeframe[:-1])
+    return n * {"m": 60, "h": 3600, "d": 86400}[unit] * 1000
+
+
+def _newest_open_ms(rows) -> int | None:
+    """Open time of the newest candle in a proxy klines payload (None if empty)."""
+    return int(rows[-1][0]) if rows else None
+
+
+def _stale_series(newest_open_ms: int | None, timeframe: str, *, now_ms: int,
+                  max_age_intervals: int = _MAX_AGE_INTERVALS) -> bool:
+    """Is this series too old to trade on?
+
+    Measured against the newest candle's OPEN time. The allowance is 2 intervals: the candle
+    currently forming is never the newest CLOSED bar, and publish/clock slack costs a little more.
+    Tighter false-alarms every cycle; looser lets a genuinely dead feed through — which is the real
+    risk, because a proxy answering from cache while its upstream is broken will serve hours-old
+    candles perfectly happily and the desk would size a book on a stale tape.
+    """
+    if newest_open_ms is None:
+        return True
+    return (now_ms - int(newest_open_ms)) > max_age_intervals * _interval_ms(timeframe)
+
+
+def _warm_klines(symbols, timeframe: str = "4h", proxy_url: str = "",
+                 now_ms: int | None = None) -> tuple[int, list[str], str | None]:
+    """Pre-fetch every series the cycle is about to use, through the local binance-proxy.
+
+    Returns (warmed, stale_symbols, error). Runs BEFORE preflight so the proxy has already
+    coalesced and cached the batch — preflight then reads warm data instead of racing Binance's
+    rate limiter mid-cycle, which is the burst that produced the -1003 bans at cy299/301/306/310.
+
+    Best-effort on the warm itself (a symbol that fails here is simply not pre-warmed; preflight
+    will try it again and the existing HOLD-ON-DATA-OUTAGE path covers a real outage). The STALE
+    list is the part that matters: it is the caller's signal that the tape is not current.
+    """
+    if not proxy_url:
+        return 0, [], "no klines proxy configured"
+    from futures_fund.exchange import _proxy_get_klines
+    now_ms = now_ms if now_ms is not None else int(time.time() * 1000)
+    warmed, stale, err = 0, [], None
+    for raw in symbols:
+        try:
+            rows = _proxy_get_klines(
+                f"{proxy_url.rstrip('/')}/fapi/v1/klines",
+                params={"symbol": raw, "interval": timeframe, "limit": _KLINES_WARM_LIMIT})
+        except Exception as e:  # noqa: BLE001, PERF203 — one bad symbol must not stop the warm
+            err = err or f"{raw}: {str(e)[:120]}"
+            stale.append(raw)
+            continue
+        warmed += 1
+        if _stale_series(_newest_open_ms(rows), timeframe, now_ms=now_ms):
+            stale.append(raw)
+    return warmed, stale, err
+
+
 def _veto_reasons(state_dir, cycle: int) -> str:
     """The gate's veto REASONS for this cycle, read from the shadow ledger.
 
@@ -602,6 +667,23 @@ def main() -> int:
     uni = json.load(open(upath))
     uni_syms = [s["symbol"] for s in uni.get("universe", uni.get("candidates", []))]
     symbols = list(dict.fromkeys(uni_syms + _held_symbols()))  # union, order-preserving
+
+    # DATA BEFORE THE CYCLE (operator requirement, non-negotiable): warm every series through the
+    # local binance-proxy first, and refuse to trade a stale tape.
+    _tf = "4h"
+    _proxy = load_settings().exchange.klines_proxy_url
+    _warmed, _stale, _werr = _warm_klines(
+        [s.split("/")[0] + "USDT" for s in symbols], _tf, _proxy)
+    print(f"warm: {_warmed}/{len(symbols)} series via proxy {_proxy or '(none)'}"
+          + (f" | stale: {'/'.join(x.replace('USDT', '') for x in _stale)}" if _stale else "")
+          + (f" | err: {_werr}" if _werr else ""))
+    if _stale:
+        longs, shorts = _book()
+        print(f"HOLD-ON-STALE-DATA cycle {cycle}: {len(_stale)} of {len(symbols)} series are older "
+              f"than {_MAX_AGE_INTERVALS} x {_tf} — refusing to size a book on a stale tape. "
+              f"book held. LONG {'/'.join(longs)} vs SHORT {'/'.join(shorts)} | {_pnl_line()}")
+        return _exit_code(longs, shorts)
+
     pf = run(["scripts/preflight.py", "--cycle", str(cycle), "--symbols", ",".join(symbols)])
     if not os.path.exists(os.path.join(cdir, "context.json")):
         _bu = _capture_ban(_state, pf.stderr, pf.stdout)

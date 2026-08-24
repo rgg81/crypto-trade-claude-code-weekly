@@ -65,7 +65,17 @@ def test_no_path_in_main_can_hardcode_a_success_exit():
     src = inspect.getsource(auto_cycle.main)
     assert "return 0" not in src, (
         "a path in main() hardcodes a success exit instead of reporting the book")
-    assert src.count("return _exit_code(longs, shorts)") == 8
+    # Count-agnostic: EVERY return in main must be _exit_code(...). A hardcoded count would just
+    # have to be bumped each time a path is added, which teaches nothing; this states the property
+    # so a new early-return is checked rather than merely tallied.
+    import ast
+    import textwrap
+    fn = ast.parse(textwrap.dedent(src)).body[0]
+    returns = [n for n in ast.walk(fn) if isinstance(n, ast.Return)]
+    assert returns, "main() must return explicitly"
+    for r in returns:
+        assert isinstance(r.value, ast.Call) and getattr(r.value.func, "id", "") == "_exit_code", (
+            f"line {r.lineno}: return must route through _exit_code, got {ast.unparse(r.value)}")
 
 
 def test_every_hold_path_reports_the_book_it_is_holding():
