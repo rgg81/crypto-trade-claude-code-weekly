@@ -368,6 +368,10 @@ _EXIT_FLAT = 2      # naked-sleeve mandate violation (not a crash)
 
 _KLINES_WARM_LIMIT = 500          # matches FuturesExchange.ohlcv's default
 _MAX_AGE_INTERVALS = 2            # one for the forming candle, one for clock/publish slack
+# The proxy throttles proactively at 80% of Binance's weight budget, so a warm request can
+# legitimately sit in its queue. 30s was too tight: at cy340 BTCUSDT timed out while the proxy sat
+# at used_weight 1915/2400, and an immediate retry served it from cache in 1.8ms.
+_WARM_TIMEOUT_S = 60
 
 
 def _interval_ms(timeframe: str) -> int:
@@ -418,10 +422,16 @@ def _warm_klines(symbols, timeframe: str = "4h", proxy_url: str = "",
         try:
             rows = _proxy_get_klines(
                 f"{proxy_url.rstrip('/')}/fapi/v1/klines",
-                params={"symbol": raw, "interval": timeframe, "limit": _KLINES_WARM_LIMIT})
+                params={"symbol": raw, "interval": timeframe, "limit": _KLINES_WARM_LIMIT},
+                timeout=_WARM_TIMEOUT_S)
         except Exception as e:  # noqa: BLE001, PERF203 — one bad symbol must not stop the warm
+            # A fetch failure is NOT staleness: it means we have no information about freshness,
+            # which is a different thing from knowing the tape is old. cy340 lost a whole 4h cycle
+            # to that conflation — BTCUSDT "timed out" while the proxy throttled, was marked stale,
+            # and HOLD-ON-STALE-DATA aborted the tick; the retry served it from cache in 1.8ms and
+            # the proxy was never banned. Surface the error, leave freshness unjudged, and let
+            # preflight retry — its HOLD-ON-DATA-OUTAGE path covers a genuine outage.
             err = err or f"{raw}: {str(e)[:120]}"
-            stale.append(raw)
             continue
         warmed += 1
         if _stale_series(_newest_open_ms(rows), timeframe, now_ms=now_ms):

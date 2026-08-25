@@ -86,3 +86,60 @@ def test_the_cycle_warms_before_preflight():
     assert "_warm_klines(" in src
     assert src.index("_warm_klines(") < src.index("scripts/preflight.py"), (
         "warming after preflight would not protect the cycle's own fetches")
+
+
+# ---------------------------------------------------------------------------------------------
+# STALE means "we got data and it is old" — NOT "we could not fetch it".
+# ---------------------------------------------------------------------------------------------
+def test_a_warm_timeout_is_not_stale(monkeypatch):
+    """cy340 lost a whole 4h cycle to this.
+
+        warm: 12/13 series via proxy | stale: BTC | err: BTCUSDT: timed out
+        HOLD-ON-STALE-DATA cycle 340: 1 of 13 series are older than 2 x 4h
+
+    BTCUSDT had not gone stale — the request timed out while the proxy was throttling at its
+    weight threshold (used_weight 1915/2400). Retried immediately afterwards it returned in 1.8ms
+    from cache, and the proxy was never banned.
+
+    A fetch failure means we have NO information about freshness, which is not the same as knowing
+    the tape is old. `_warm_klines`'s own docstring already said so — "a symbol that fails here is
+    simply not pre-warmed; preflight will try it again and the existing HOLD-ON-DATA-OUTAGE path
+    covers a real outage" — but the code appended to `stale` anyway and aborted the cycle.
+
+    Errors are still surfaced; they just no longer masquerade as staleness.
+    """
+    from scripts import auto_cycle
+
+    def boom(url, params=None, timeout=None):
+        if params["symbol"] == "BTCUSDT":
+            raise TimeoutError("timed out")
+        return [[_now_ms() - H4, "1", "1", "1", "1", "1"]]
+
+    monkeypatch.setattr(auto_cycle, "_proxy_get_klines", boom, raising=False)
+    monkeypatch.setattr("futures_fund.exchange._proxy_get_klines", boom)
+    warmed, stale, err = auto_cycle._warm_klines(
+        ["ETHUSDT", "BTCUSDT", "SOLUSDT"], "4h", "http://x")
+    assert stale == [], "a fetch failure must not be reported as stale data"
+    assert err and "BTCUSDT" in err, "the failure must still be surfaced"
+    assert warmed == 2
+
+
+def test_genuinely_old_data_is_still_stale(monkeypatch):
+    """The guard must keep doing its real job: data we DID get, that is old, still holds."""
+    from scripts import auto_cycle
+
+    def old(url, params=None, timeout=None):
+        return [[_now_ms() - 12 * H4, "1", "1", "1", "1", "1"]]
+
+    monkeypatch.setattr("futures_fund.exchange._proxy_get_klines", old)
+    warmed, stale, err = auto_cycle._warm_klines(["ETHUSDT"], "4h", "http://x")
+    assert stale == ["ETHUSDT"]
+    assert warmed == 1
+
+
+def test_the_warm_timeout_allows_for_proxy_throttling():
+    """The proxy throttles proactively at 80% of Binance's weight budget, so a warm request can
+    legitimately queue. 30s was too tight under load; give it room."""
+    from scripts.auto_cycle import _WARM_TIMEOUT_S
+
+    assert _WARM_TIMEOUT_S >= 60
