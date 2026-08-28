@@ -322,8 +322,14 @@ def test_deployment_resizes_skips_wide_stop_leg_at_ceiling_during_refill():
     # An under-deployed book triggers a refill, but a wide-stop SHORT (WLD, 11% stop, ~$886 rm=1
     # ceiling) has landed == its notional -> NOT flagged (reopening can't grow it). The tight legs
     # with room ARE flagged. B is short-limited to WLD+UNI ceilings.
+    #
+    # Notionals re-based when RESIZE_DEFICIT moved 0.90 -> 0.50: the old $900 legs sat at ~83% of
+    # their landed targets (BTC/SOL landed $1084.63, UNI $1282.89), i.e. mild drift with a ~50-cycle
+    # (8-day) payback — exactly the churn the new threshold removes. These are genuinely starved
+    # (<50% of landed), so the behaviour under test — ceiling-bound leg skipped, legs with room
+    # refilled together — is preserved rather than weakened.
     holdings = {"BTCUSDT": "long", "SOLUSDT": "long", "WLDUSDT": "short", "UNIUSDT": "short"}
-    notional = {"BTCUSDT": 900.0, "SOLUSDT": 900.0, "WLDUSDT": 884.0, "UNIUSDT": 900.0}
+    notional = {"BTCUSDT": 400.0, "SOLUSDT": 400.0, "WLDUSDT": 886.36, "UNIUSDT": 500.0}
     stop = {"BTCUSDT": 0.025, "SOLUSDT": 0.038, "WLDUSDT": 0.11, "UNIUSDT": 0.076}
     out = bs.deployment_resizes(holdings, notional, equity=9750.0, n_per_side=2, band=0.15,
                                 per_trade_risk_pct=0.01, stop_frac_by_sym=stop)

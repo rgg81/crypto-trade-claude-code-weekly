@@ -192,6 +192,26 @@ def _waterfill(legs: list[str], budget: float, ceil) -> dict[str, float]:
     return alloc
 
 
+# A resize is a close+reopen: two taker fills, 0.14% of the leg's CURRENT notional, paid now to buy
+# a bigger leg later. Measured over the 355 recorded cycles the desk's gross price edge is 0.008401%
+# per cycle per dollar deployed, so payback on a top-up is:
+#
+#     leg at 90% of target -> 150 cycles (25 days)      <- the old `* 0.90` trigger
+#     leg at 75%           ->  50 cycles ( 8 days)
+#     leg at 50%           ->  17 cycles ( 3 days)      <- here
+#     leg at 25%           ->   6 cycles ( 1 day)
+#
+# A leg's real holding period is 1-2 days (the book turns over in ~3-6 cycles), so the old trigger
+# bought top-ups that could never pay back before the leg rotated away. It fired on 123 of 381 opens
+# (32.3%) for ~$86 of the ~$561 fee bill and ZERO signal — replaying with resizes removed leaves
+# gross completely unchanged and improves net by exactly $86.10 in BOTH halves of the record.
+#
+# Not deleted, because this is the only gate-respecting way out of a deployment collapse (held legs
+# cannot pyramid; cy290-291 sat at 0.11x against a 0.85x target and could not climb back). That is
+# an ~87% deficit and still fires. What stops is the routine drift top-up.
+RESIZE_DEFICIT = 0.50
+
+
 def deployment_resizes(holdings: dict[str, str], notional_by_sym: dict[str, float],
                        equity: float, n_per_side: int, *, band: float = 0.30,
                        per_trade_risk_pct: float | None = None,
@@ -272,7 +292,8 @@ def deployment_resizes(holdings: dict[str, str], notional_by_sym: dict[str, floa
                        for legs in sides.values() if legs)
         if deployed >= book * (1.0 - band):
             return set()                          # already near the achievable book -> no churn
-        return {s for s in holdings if notional_by_sym.get(s, 0.0) < landed.get(s, 0.0) * 0.90}
+        return {s for s in holdings
+                if notional_by_sym.get(s, 0.0) < landed.get(s, 0.0) * RESIZE_DEFICIT}
 
     # PLAN-AWARE PATH. Judge deployment against the INTENDED book — kept legs plus the slots this
     # cycle will open — instead of water-filling across kept legs only. Water-filling a partial
@@ -291,7 +312,7 @@ def deployment_resizes(holdings: dict[str, str], notional_by_sym: dict[str, floa
     if deployed >= book * (1.0 - band):
         return set()                              # intended book is near target -> no churn
     return {s for s in holdings
-            if notional_by_sym.get(s, 0.0) < min(per_slot, _ceil(s)) * 0.90}
+            if notional_by_sym.get(s, 0.0) < min(per_slot, _ceil(s)) * RESIZE_DEFICIT}
 
 
 def make_room_for_adds(plan: dict, holdings: dict[str, str],

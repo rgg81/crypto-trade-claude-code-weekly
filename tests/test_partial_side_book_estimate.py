@@ -39,7 +39,12 @@ BAND = 0.30
 # The live cy295 book: three kept longs, one kept short mid-rotation, two shorts rotating in.
 HOLDINGS = {"BTWUSDT": "long", "LINKUSDT": "long", "SOLUSDT": "long", "XRPUSDT": "short"}
 STOP_FRAC = {"BTWUSDT": 0.21438, "LINKUSDT": 0.02995, "SOLUSDT": 0.01641, "XRPUSDT": 0.014421}
-NOTIONAL = {"BTWUSDT": 78.90, "LINKUSDT": 563.72, "SOLUSDT": 839.23, "XRPUSDT": 700.00}
+# Live cy295 notionals were BTW 78.90 / LINK 563.72 / SOL 839.23. They are scaled down here
+# because RESIZE_DEFICIT moved 0.90 -> 0.50: at the live levels LINK/SOL sat at ~68-100% of their
+# $830.70 slot target, i.e. mild drift with a ~50-cycle payback, which the new threshold correctly
+# declines to churn. The RATIO between legs — which is what drives the `book` computation under
+# test — is preserved; only the absolute deficit is deepened so a refill genuinely fires.
+NOTIONAL = {"BTWUSDT": 40.00, "LINKUSDT": 300.00, "SOLUSDT": 350.00, "XRPUSDT": 700.00}
 PLANNED = {"long": 0, "short": 2}
 
 
@@ -82,6 +87,7 @@ def test_the_top_up_converges_rather_than_churning():
     else:
         pytest.fail(f"never converged; still flagging {sorted(_resize(notional_by_sym=filled))}")
     assert filled["LINKUSDT"] > NOTIONAL["LINKUSDT"], "top-up must actually grow the sleeve"
+    assert filled["LINKUSDT"] >= 415.35, "and must clear the 50% deficit threshold once filled"
 
 
 def _per_slot(notional):
@@ -102,7 +108,7 @@ def test_a_full_book_is_unchanged():
     """Both sides at n_per_side: no scaling applies, so behaviour matches the old code exactly."""
     holdings = {**HOLDINGS, "ADAUSDT": "short", "DOTUSDT": "short"}
     stop = {**STOP_FRAC, "ADAUSDT": 0.02, "DOTUSDT": 0.03}
-    notional = {**NOTIONAL, "ADAUSDT": 800.0, "DOTUSDT": 800.0}
+    notional = {**NOTIONAL, "ADAUSDT": 300.0, "DOTUSDT": 300.0}
     full = deployment_resizes(holdings, notional, EQ, N, band=BAND, per_trade_risk_pct=PTR,
                               stop_frac_by_sym=stop,
                               planned_opens_by_side={"long": 0, "short": 0})
@@ -117,7 +123,7 @@ def test_a_well_deployed_book_still_refuses_to_churn():
     assert _resize(notional_by_sym=near) == set()
 
 
-@pytest.mark.parametrize("notional,flagged", [(1500.0, True), (1520.0, False)])
+@pytest.mark.parametrize("notional,flagged", [(830.0, True), (850.0, False)])
 def test_the_book_never_exceeds_the_neutral_half(notional, flagged):
     """A partial side is scaled UP by this fix — pin that it can never inflate `book` past
     equity/2, which would size the desk above 1x gross.
@@ -138,7 +144,8 @@ def test_the_book_never_exceeds_the_neutral_half(notional, flagged):
     resize = deployment_resizes(holdings, notional_by_sym, EQ, N, band=BAND,
                                 per_trade_risk_pct=PTR, stop_frac_by_sym=sf,
                                 planned_opens_by_side={"long": 0, "short": 2})
-    threshold = min((EQ / 2.0) / N, 0.25 * EQ) * 0.90
-    assert threshold == pytest.approx(1510.48, abs=0.01)
+    from futures_fund.blended_score import RESIZE_DEFICIT
+    threshold = min((EQ / 2.0) / N, 0.25 * EQ) * RESIZE_DEFICIT
+    assert threshold == pytest.approx(839.16, abs=0.01)
     assert ("AAAUSDT" in resize) is flagged, (
         f"notional {notional} vs clamped threshold {threshold:.2f}; got {sorted(resize)}")
