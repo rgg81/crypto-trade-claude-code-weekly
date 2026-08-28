@@ -361,7 +361,16 @@ def _review_summary_line(report: dict) -> str:
 # Max fraction the neutrality guard may trim off a sleeve in ONE pass. One missing leg out of
 # n_per_side=3 needs |3-2|/3 = 0.333, so the routine case still corrects fully; the cap only bites
 # when more than one leg is gone — the runaway that took cy291 to 0.11x deployment.
-_GUARD_TILT_BAND = 0.03     # trim only when the DOLLARS are out of band
+_GUARD_TILT_BAND = 0.03
+
+# FACTOR BOOK GEOMETRY. 20 legs/side = 40 legs. The ceiling is the gate's own budget, not a
+# preference: max_heat / consolidate's dust floor = 0.10/0.001 = 100 legs at the healthy tier, but
+# the caution tier halves heat to 0.05 -> 50 legs, below which legs fall under the dust floor and
+# are silently dropped. 40 leaves margin in caution. Measured drawdown at 20/side is 13.5%, which
+# also keeps the book clear of the -15% force-flatten (at 3 legs/side it was 35%).
+_N_PER_SIDE = 20
+# Rebalance daily (6 x 4h), not every tick: same Sharpe, fees $1702 -> $766 over the record.
+_REBALANCE_EVERY = 6     # trim only when the DOLLARS are out of band
 _GUARD_TRIM_CAP = 0.35
 _EXIT_FLAT = 2      # naked-sleeve mandate violation (not a crash)
 
@@ -661,7 +670,11 @@ def main() -> int:
     # one still exits _EXIT_FLAT. The violation does not stop being a violation because the tick
     # that would have repaired it could not fetch prices — cy296 held an L3/S0 book through a ban
     # and reported success.
-    sc = run(["scripts/scout_cli.py", "--cycle", str(cycle), "--top", "12"])
+    # WIDE UNIVERSE. The desk is now a cross-sectional factor book: breadth IS the edge. Measured
+    # over 230 perps x 2190 4h bars, the same momentum signal returns Sharpe 1.19 with a 35%
+    # drawdown at 3 legs/side and Sharpe 3.24 with a 13.5% drawdown at 20/side. Twelve names cannot
+    # support 40 legs, so the scout now ranks the top 100 by 24h volume.
+    sc = run(["scripts/scout_cli.py", "--cycle", str(cycle), "--top", "100"])
     upath = os.path.join(cdir, "universe.json")
     if not os.path.exists(upath):
         # record any -1003 ban deadline so the NEXT fire holds before fetching (self-heal)
@@ -714,19 +727,20 @@ def main() -> int:
              "signals": {"catalyst_count": 0, "risk_off_flag": 0}} for s in raw]
     json.dump(reps, open(os.path.join(cdir, "analyst_reports.json"), "w"), indent=2)
 
-    bb = run(["scripts/blended_book_cli.py", "--cycle", str(cycle)])
+    bb = run(["scripts/xsection_book_cli.py", "--cycle", str(cycle),
+              "--n-per-side", str(_N_PER_SIDE), "--rebalance-every", str(_REBALANCE_EVERY)])
     if not os.path.exists(os.path.join(cdir, "proposals.json")):
         _capture_ban(_state, bb.stderr, bb.stdout)
         longs, shorts = _book()
-        print(f"HOLD-ON-DATA-OUTAGE cycle {cycle}: blended_book_cli produced no proposals — book "
+        print(f"HOLD-ON-DATA-OUTAGE cycle {cycle}: xsection_book_cli produced no proposals — book "
               f"held, retry next tick. LONG {'/'.join(longs)} vs SHORT {'/'.join(shorts)} | "
               f"{_pnl_line()} | err: {bb.stderr.strip()[-300:]}")
         return _exit_code(longs, shorts)
     try:
-        plan = json.loads(bb.stdout)["plan"]
-        nrot = len(plan["close"]) + len(plan["open_long"]) + len(plan["open_short"])
-        print(f"plan: keep L{plan['keep_long']} S{plan['keep_short']} | open L{plan['open_long']} "
-              f"S{plan['open_short']} | close {plan['close']} | rot {nrot}")
+        d = json.loads(bb.stdout)
+        print(f"book: priced {d['priced']}/{d['universe']} | rebalancing {d['rebalancing']} | "
+              f"target L{d['book']['long']}/S{d['book']['short']} | open {d['open']} "
+              f"close {d['close']} hold {d['hold']}")
     except Exception:  # noqa: BLE001
         pass
 
