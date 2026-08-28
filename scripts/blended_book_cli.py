@@ -138,10 +138,20 @@ def main() -> None:
     # leaves behind after trimming to a dropped-open book — deployment collapsed 0.85x -> 0.11x at
     # cy290-291 and could not climb back out.
     planned_opens = {"long": len(plan["open_long"]), "short": len(plan["open_short"])}
+    # A TOP-UP MUST PAY FOR ITSELF TOO. The close+reopen costs two taker fills on the WHOLE leg to
+    # add only the shortfall; with no measured price alpha at 4h (blend rank-IC +0.0010, t=+0.05),
+    # the added notional's only expected income is carry. cy357 paid four fills to grow two legs and
+    # the neutrality guard trimmed most of it straight back, leaving the book SMALLER (0.237x ->
+    # 0.170x). Growing a zero-edge book buys fees and variance, not edge.
+    _funding = {p["symbol"]: (float((by_sym.get(p["symbol"]) or {}).get("funding_rate") or 0.0),
+                              float((by_sym.get(p["symbol"]) or {}).get("funding_interval_hours")
+                                    or 8.0))
+                for p in positions if p.get("symbol")}
     resize = bs.deployment_resizes(kept_now, notional_by_sym, equity, args.n_per_side,
                                    band=args.resize_band, per_trade_risk_pct=ptr,
                                    stop_frac_by_sym=stop_frac_by_sym,
-                                   planned_opens_by_side=planned_opens)
+                                   planned_opens_by_side=planned_opens,
+                                   funding_by_sym=_funding)
     for sym in resize:                                  # kept-but-undersized -> close + reopen
         (plan["keep_long"] if holdings[sym] == "long" else plan["keep_short"]).remove(sym)
         (plan["open_long"] if holdings[sym] == "long" else plan["open_short"]).append(sym)

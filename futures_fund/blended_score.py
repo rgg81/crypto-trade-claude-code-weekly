@@ -214,11 +214,28 @@ def _waterfill(legs: list[str], budget: float, ceil) -> dict[str, float]:
 RESIZE_DEFICIT = 0.50
 
 
+
+# Median observed holding period of a leg over the desk's own 353-cycle record: 4 cycles (16h).
+# DESCRIPTIVE, not fitted — it is how long a leg actually lives, and a SHORT horizon makes the gate
+# STRICTER (less carry credited against the same two fills), which is the conservative direction.
+ROTATION_HOLD_CYCLES = 4
+
+# Assumed price alpha per rotation. ZERO, and that is a measurement, not a placeholder: over 353
+# cycles the rank-IC of every traded signal against the NEXT-cycle return is indistinguishable from
+# noise (momentum_20 +0.0018 t=+0.08, carry -0.0024 t=-0.12, mean-reversion +0.0013 t=+0.06, the
+# live blend +0.0010 t=+0.05). With no price edge, a rotation's only expected income is the funding
+# differential it captures, so carry alone must pay for the two taker fills it costs.
+ROTATION_PRICE_EDGE_BPS = 0.0
+
 def deployment_resizes(holdings: dict[str, str], notional_by_sym: dict[str, float],
                        equity: float, n_per_side: int, *, band: float = 0.30,
                        per_trade_risk_pct: float | None = None,
                        stop_frac_by_sym: dict[str, float] | None = None,
-                       planned_opens_by_side: dict[str, int] | None = None) -> set[str]:
+                       planned_opens_by_side: dict[str, int] | None = None,
+                       funding_by_sym: dict[str, tuple[float, float]] | None = None,
+                       resize_price_edge_bps: float = ROTATION_PRICE_EDGE_BPS,
+                       hold_cycles: int = ROTATION_HOLD_CYCLES,
+                       slippage_bps: float = 2.0) -> set[str]:
     """COORDINATED deployment top-up: which held legs to CLOSE+REOPEN to grow a frozen book to ~1x.
 
     Held legs can't pyramid (a same-direction re-proposal is "left untouched") and the pre-sizer
@@ -234,7 +251,16 @@ def deployment_resizes(holdings: dict[str, str], notional_by_sym: dict[str, floa
       Otherwise the book is materially under-deployed -> resize EVERY leg below its landed size, on
       BOTH sides, so they reopen together and the pre-sizer fills both sides to B.
 
-    A wide-stop leg already at its ceiling has landed == its notional, so it is never flagged."""
+    A wide-stop leg already at its ceiling has landed == its notional, so it is never flagged.
+
+    COST GATE (opt-in via `funding_by_sym`): a top-up closes and reopens the WHOLE leg — two taker
+    fills on `current + target` — to add only `target - current`. Its payoff is what that ADDED
+    notional earns. This desk has no measured price alpha at 4h (blend rank-IC +0.0010, t=+0.05
+    over 353 cycles; confirmed on a 1-year 60-symbol panel), so `resize_price_edge_bps` defaults to
+    0 and the shortfall must be paid for by CARRY alone — which it almost never can. That is the
+    correct answer, not a bug: growing a zero-edge book buys fees and variance, not edge. A caller
+    who believes there IS an edge to deploy into can say so via `resize_price_edge_bps`. Omitting
+    `funding_by_sym` leaves the legacy (ungated) behaviour untouched."""
     if equity <= 0 or n_per_side <= 0 or not holdings:
         return set()
     name_cap = 0.25 * equity
@@ -294,8 +320,11 @@ def deployment_resizes(holdings: dict[str, str], notional_by_sym: dict[str, floa
                        for legs in sides.values() if legs)
         if deployed >= book * (1.0 - band):
             return set()                          # already near the achievable book -> no churn
-        return {s for s in holdings
-                if notional_by_sym.get(s, 0.0) < landed.get(s, 0.0) * RESIZE_DEFICIT}
+        flagged = {s for s in holdings
+                   if notional_by_sym.get(s, 0.0) < landed.get(s, 0.0) * RESIZE_DEFICIT}
+        return _affordable_resizes(flagged, holdings, notional_by_sym,
+                                   {s: landed.get(s, 0.0) for s in flagged}, funding_by_sym,
+                                   resize_price_edge_bps, hold_cycles, slippage_bps)
 
     # PLAN-AWARE PATH. Judge deployment against the INTENDED book — kept legs plus the slots this
     # cycle will open — instead of water-filling across kept legs only. Water-filling a partial
@@ -313,8 +342,44 @@ def deployment_resizes(holdings: dict[str, str], notional_by_sym: dict[str, floa
                    for d in ("long", "short"))
     if deployed >= book * (1.0 - band):
         return set()                              # intended book is near target -> no churn
-    return {s for s in holdings
-            if notional_by_sym.get(s, 0.0) < min(per_slot, _ceil(s)) * RESIZE_DEFICIT}
+    flagged = {s for s in holdings
+               if notional_by_sym.get(s, 0.0) < min(per_slot, _ceil(s)) * RESIZE_DEFICIT}
+    return _affordable_resizes(flagged, holdings, notional_by_sym,
+                               {s: min(per_slot, _ceil(s)) for s in flagged}, funding_by_sym,
+                               resize_price_edge_bps, hold_cycles, slippage_bps)
+
+
+def _affordable_resizes(flagged: set[str], holdings: dict[str, str],
+                        notional_by_sym: dict[str, float], target_by_sym: dict[str, float],
+                        funding_by_sym: dict[str, tuple[float, float]] | None,
+                        price_edge_bps: float, hold_cycles: int,
+                        slippage_bps: float) -> set[str]:
+    """Drop top-ups whose added notional cannot repay the two fills the close+reopen costs.
+
+    No `funding_by_sym` => no cost model => legacy behaviour, everything survives. Shrink-only.
+    """
+    if funding_by_sym is None:
+        return flagged
+    fee = TAKER_RATE + max(0.0, float(slippage_bps)) / 10_000.0
+    hold_hours = max(1.0, float(hold_cycles) * 4.0)
+    # ALL-OR-NOTHING, matching this module's contract. A top-up only grows a DOLLAR-NEUTRAL book if
+    # both sides reopen together — the balancer pins each side to the smaller, so a leg resized
+    # alone just reopens at the same balance-capped size and churns. Judging symbols individually
+    # would let one side through and leave the other frozen, manufacturing exactly that churn (and
+    # a one-sided proposal set). So price the WHOLE top-up as a single decision.
+    total_cost = total_gain = 0.0
+    for sym in flagged:
+        current = abs(float(notional_by_sym.get(sym, 0.0)))
+        target = abs(float(target_by_sym.get(sym, 0.0)))
+        added = target - current
+        if added <= 0:
+            continue
+        total_cost += (current + target) * fee   # close the whole leg, reopen the whole leg
+        rate, interval = funding_by_sym.get(sym, (0.0, 8.0))
+        brief = {"funding_rate": rate, "funding_interval_hours": interval}
+        total_gain += (added * float(price_edge_bps) / 10_000.0
+                       + _carry_over(brief, added, holdings.get(sym, "long"), hold_hours))
+    return flagged if total_gain > total_cost else set()
 
 
 def make_room_for_adds(plan: dict, holdings: dict[str, str],
@@ -494,18 +559,6 @@ def admissible_stop_frac(direction: str | None, *, leverage: float = 1.0) -> flo
         out.append(abs(entry - liq) / entry / MIN_LIQ_DISTANCE_MULT)
     return min(out)
 
-
-# Median observed holding period of a leg over the desk's own 353-cycle record: 4 cycles (16h).
-# DESCRIPTIVE, not fitted — it is how long a leg actually lives, and a SHORT horizon makes the gate
-# STRICTER (less carry credited against the same two fills), which is the conservative direction.
-ROTATION_HOLD_CYCLES = 4
-
-# Assumed price alpha per rotation. ZERO, and that is a measurement, not a placeholder: over 353
-# cycles the rank-IC of every traded signal against the NEXT-cycle return is indistinguishable from
-# noise (momentum_20 +0.0018 t=+0.08, carry -0.0024 t=-0.12, mean-reversion +0.0013 t=+0.06, the
-# live blend +0.0010 t=+0.05). With no price edge, a rotation's only expected income is the funding
-# differential it captures, so carry alone must pay for the two taker fills it costs.
-ROTATION_PRICE_EDGE_BPS = 0.0
 
 
 def apply_rotation_cost_gate(plan: dict, briefs_by_sym: dict, holdings: dict[str, str],
