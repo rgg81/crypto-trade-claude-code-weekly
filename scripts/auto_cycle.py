@@ -1,8 +1,8 @@
 """Deterministic, LLM-FREE driver for one TEMPEST-NEUTRAL 4h tick.
 
-The all-weather desk is now a deterministic engine (blended_score + the gate), so a full cycle
-needs NO model inference: scout -> preflight -> (deterministic news-neutral overlay) ->
-blended_book_cli -> reclassify -> gate (once) -> post-gate neutrality guard. This script runs that
+The desk is a deterministic CROSS-SECTIONAL FACTOR engine (xsection + the gate), so a full cycle
+needs NO model inference: scout (top 100) -> preflight -> (deterministic news-neutral overlay) ->
+xsection_book_cli -> reclassify -> gate (once) -> post-gate neutrality guard. This script runs that
 end-to-end so the loop survives Anthropic API outages — an OS cron fires it every ~30min regardless
 of whether any LLM turn succeeds. The single-flight run lock + served-candle idempotency make it
 safe to also run a manual `/loop` review concurrently; a SKIP tick is a cheap no-op.
