@@ -8,7 +8,9 @@ portfolios on it. Everything is cached to disk, so re-runs cost zero API calls.
 
 ## Findings, 2026-08-28 (1 year x 60 symbols x 2190 4h bars)
 
-**Read these before proposing a new edge for this desk — most obvious ideas are already refuted.**
+**Read these before proposing a new edge for this desk.** NOTE: findings 1-5 below were all measured
+on TOP-N/BOTTOM-N books and are superseded in scope by the breadth section further down — the "no
+edge" conclusion was an artifact of concentration, not an absence of signal.
 
 1. **The desk has no price alpha at 4h.** Rank-IC of every traded signal vs the next-cycle return
    over the live 353-cycle record: momentum +0.0018 (t +0.08), carry -0.0024 (t -0.12),
@@ -40,6 +42,47 @@ portfolios on it. Everything is cached to disk, so re-runs cost zero API calls.
    gross on liquid majors (BTC +3.33%, LINK +4.69%, UNI +4.46%, ETH +2.38%; BTC funding positive in
    76% of settlements). Median across the top 25 is +1.93%/yr, equal-weight mean -0.89%/yr (dragged
    by outliers like ONG at -90%/yr). Requires SPOT legs, which this futures-only desk does not have.
+
+## 2026-08-28 (later) — THE EARLIER "NO EDGE" CONCLUSION WAS WRONG. Breadth was the problem.
+
+Everything above tested top-3/bottom-3 out of a small universe. That is not a quant book, it is a
+concentrated punt on the two most extreme names — which in crypto are the most volatile. It is
+exactly why signals with clearly positive IC produced losing portfolios: the book only ever
+harvested the signal where the fat tails live. Rebuilt properly (`xsection_lab.py`) on 230 perps x
+2190 4h bars, with:
+
+  * a SMALL weight in EVERY name, proportional to cross-sectional z-score (not top-N),
+  * inverse-volatility leg scaling,
+  * ITERATED beta-neutralisation PLUS an explicit market hedge (one pass is not enough — de-meaning
+    after the projection re-introduces beta; realised beta only fell -0.271 -> -0.052 with both),
+  * a per-name weight cap and a turnover cap.
+
+**HEADLINE (top-100 by volume, restricted to names listed the FULL year = 87 names; momentum over
+150 bars / 25 days; beta-hedged; turnover cap 2% of gross per bar):**
+
+    sharpe 2.48 (t 2.48) | +3.86%/month | max drawdown 10.2% | fees $285 | turnover 41x
+    split-half   H1 +2.98   H2 +2.10
+    realised beta -0.047 | UP tape -0.000%/bar | DOWN tape +0.046%/bar
+    quarters     Q1 +18.1%  Q2 +8.8%  Q3 +2.2%  Q4 +20.8%   (all four positive)
+    fees         .05% -> 2.52   .07% -> 2.48   .12% -> 2.38   .20% -> 2.21
+
+**BREADTH IS THE WHOLE STORY** — same signal, only the leg count changes:
+
+    legs/side    3      5      8      12     20     30     87
+    sharpe      1.19   1.57   1.75   1.90   1.96   2.25   2.48
+    max DD     35.3%  26.1%  21.4%  18.5%  13.8%  11.0%  10.2%
+
+`IR = IC*sqrt(breadth)`, measured. Note the desk's CURRENT 3-leg structure carries a 35% drawdown —
+it would trip the -15% force-flatten repeatedly. Concentration, not signal, was the defect.
+Minimum viable is ~30 legs/side (60 legs) to keep drawdown clear of the flatten.
+
+Robustness: the lookback is a broad plateau (mom30 1.93, mom90 1.94, mom150 1.63, mom400 1.98), not a
+knife edge; both the lookback and turnover-cap sweeps are MONOTONE; and the headline is measured with
+mid-year listings EXCLUDED, which is the main survivorship channel.
+
+Caveats to respect: one year, one regime; 87 names is a small effective sample for a factor claim;
+t=2.48 is real but not overwhelming; and this needs ~60 legs, which the current gate (built for 3-6
+legs with per-trade stops and a heat cap) cannot express without a sizing redesign.
 
 ## Statistical guardrails learned the hard way
 
