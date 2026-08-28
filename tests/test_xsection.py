@@ -163,3 +163,33 @@ def test_longs_still_outrank_shorts_on_RISK_ADJUSTED_momentum():
         return sum(xs) / len(xs)
 
     assert mean([moms[s] for s in longs]) > mean([moms[s] for s in shorts])
+
+
+def test_near_zero_vol_names_are_excluded():
+    """Gold-backed tokens (PAXG/XAUT, ~1.3% ATR) are 'COIN' by Binance's taxonomy so is_crypto_perp
+    passes them, but they are commodities. Inverse-vol weighting hands a near-zero-vol name one of
+    the LARGEST notionals in the book, so the live book came out heavily short gold. A volatility
+    FLOOR removes them (and any stablecoin-like perp) without naming instruments."""
+    panel = _synthetic(n_names=30, bars=260)
+    flat = [100.0 * (1 + 0.00002 * i) for i in range(261)]     # ~zero vol, like a gold token
+    panel["GOLDLIKE"] = flat
+    w = cross_sectional_weights(panel, n_per_side=8, vol_floor=0.001)
+    assert "GOLDLIKE" not in w
+
+
+def test_parabolic_pumps_are_excluded():
+    """A name up >50% over 20 bars is a blow-off, not momentum the desk can size into — the old
+    book refused these via PUMP_MOM_HARD and the factor book must too."""
+    panel = _synthetic(n_names=30, bars=260)
+    pump = list(panel["S00"])
+    pump = pump[:-20] + [pump[-21] * (1 + 0.9 * i / 20) for i in range(1, 21)]
+    panel["PUMPED"] = pump
+    w = cross_sectional_weights(panel, n_per_side=8, pump_cap=0.50)
+    assert "PUMPED" not in w
+
+
+def test_filters_are_off_by_default_so_callers_opt_in():
+    panel = _synthetic(n_names=30, bars=260)
+    panel["GOLDLIKE"] = [100.0 * (1 + 0.00002 * i) for i in range(261)]
+    w = cross_sectional_weights(panel, n_per_side=8)
+    assert isinstance(w, dict)

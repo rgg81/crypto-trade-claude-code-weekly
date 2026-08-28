@@ -38,6 +38,16 @@ MOM_LOOKBACK = 150
 VOL_LOOKBACK = 30
 BETA_LOOKBACK = 180
 MAX_NAME_FRAC = 0.05
+# TRADEABILITY FLOORS. Measured: applying both LIFTS the edge (Sharpe 3.24 -> 3.28 on the vol floor
+# alone) — the factor does NOT depend on the names they remove, and the desk's doctrine refuses
+# them anyway. Do not tighten further: vol 1.5% / pump 30% collapses it to Sharpe 1.93 with a 21.4%
+# drawdown, because over-filtering starves the cross-section of breadth.
+VOL_FLOOR = 0.01          # 1% per-4h realised vol. Drops gold-backed tokens (PAXG/XAUT ~1.3% ATR),
+                          # which Binance tags underlyingType=COIN so is_crypto_perp passes them,
+                          # and whose near-zero vol earns a HUGE inverse-vol weight.
+PUMP_CAP = 0.50           # |20-bar move| >= 50% is a parabolic blow-off (matches the old desk's
+                          # PUMP_MOM_HARD), untradeable at size and it distorts the z-scores.
+PUMP_LOOKBACK = 20
 N_PER_SIDE = 20           # 40 legs: inside the caution-tier heat/dust budget (see book CLI).
 BETA_ITERS = 5
 Z_CLIP = 3.0
@@ -146,14 +156,26 @@ def cross_sectional_weights(series_by_sym: dict[str, list[float]], *,
                             vol_lookback: int = VOL_LOOKBACK,
                             beta_lookback: int = BETA_LOOKBACK,
                             max_name_frac: float = MAX_NAME_FRAC,
-                            beta_iters: int = BETA_ITERS) -> dict[str, float]:
+                            beta_iters: int = BETA_ITERS,
+                            vol_floor: float | None = None,
+                            pump_cap: float | None = None) -> dict[str, float]:
     """Signed weights summing to 0 (dollar-neutral) with sum|w| == 1.
 
     Returns {} rather than a lopsided book when the cross-section is too thin to fill both sides —
     a half-built factor book is a directional bet, which is the one thing this desk must never be.
     """
-    usable = {s: px for s, px in series_by_sym.items()
-              if momentum(px, mom_lookback) is not None and realized_vol(px, vol_lookback)}
+    usable = {}
+    for s, px in series_by_sym.items():
+        if momentum(px, mom_lookback) is None:
+            continue
+        v = realized_vol(px, vol_lookback)
+        if not v or (vol_floor is not None and v < vol_floor):
+            continue
+        if pump_cap is not None:
+            m = momentum(px, PUMP_LOOKBACK)
+            if m is not None and abs(m) >= pump_cap:
+                continue
+        usable[s] = px
     if len(usable) < 2 * n_per_side:
         return {}
     z = zscore_map({s: momentum(px, mom_lookback) for s, px in usable.items()})

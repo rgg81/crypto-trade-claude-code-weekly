@@ -135,3 +135,16 @@ def test_thin_universe_still_yields_a_book_not_silence():
     w = cross_sectional_weights(panel, n_per_side=n)
     assert w, "a thin universe must still produce a (smaller) book"
     assert sum(1 for v in w.values() if v > 0) == n
+
+
+def test_names_with_an_inadmissible_stop_are_dropped_before_the_book_is_built():
+    """REGRESSION. A leg whose ATR stop exceeds the gate's liq-distance ceiling (40% long /
+    36.19% short) is VETOED every time, so the sleeve executes a leg short and the book comes out
+    lopsided — the same defect the blended CLI's _too_wide filter existed to prevent. The live book
+    proposed ONG with a 54% stop. Filter it out at selection, not after the veto."""
+    from futures_fund.blended_score import admissible_stop_frac
+    ceiling = admissible_stop_frac(None)
+    assert xb.stop_ok(0.10, ceiling)
+    assert not xb.stop_ok(0.54, ceiling)
+    assert not xb.stop_ok(ceiling + 1e-6, ceiling)
+    assert xb.stop_ok(ceiling - 1e-6, ceiling)

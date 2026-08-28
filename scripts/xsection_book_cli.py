@@ -20,7 +20,13 @@ import os
 import urllib.parse
 import urllib.request
 
-from futures_fund.xsection import MOM_LOOKBACK, cross_sectional_weights
+from futures_fund.blended_score import admissible_stop_frac
+from futures_fund.xsection import (
+    MOM_LOOKBACK,
+    PUMP_CAP,
+    VOL_FLOOR,
+    cross_sectional_weights,
+)
 
 PROXY = os.environ.get("BINANCE_KLINES_PROXY", "http://127.0.0.1:8000")
 BARS = 300                # >= MOM_LOOKBACK + BETA window headroom
@@ -30,6 +36,8 @@ ATR_MULT = 2.0
 # should be closed by the SIGNAL leaving its sleeve, not by a price target — a near TP would
 # truncate winners and quietly convert the book into something else.
 RR1, RR2 = 6.0, 10.0
+# Stricter of long/short, derived from the gate itself — never hardcoded.
+_STOP_CEILING = admissible_stop_frac(None)
 
 
 # consolidate() drops any leg whose risk falls below this fraction of equity, SILENTLY.
@@ -50,6 +58,17 @@ def safe_n_per_side(requested: int, *, max_heat: float, dust_frac: float = DUST_
         return max(MIN_N_PER_SIDE, requested)
     affordable = int(max(0.0, max_heat) / dust_frac) // 2
     return max(MIN_N_PER_SIDE, min(int(requested), affordable))
+
+
+def stop_ok(stop_frac: float, ceiling: float) -> bool:
+    """Can the gate actually OPEN a leg with this stop width?
+
+    `risk_gate.MIN_LIQ_DISTANCE_MULT` requires the liquidation price to sit at least 2.5 stops away,
+    which caps the admissible stop at 40% long / 36.19% short at 1x. A wider leg is vetoed EVERY
+    cycle, so the sleeve silently executes one leg short and the book goes lopsided. Reject it at
+    selection instead — the next-ranked name takes the slot.
+    """
+    return 0.0 < stop_frac < ceiling
 
 
 def fit_n_per_side(requested: int, *, priced: int, max_heat: float,
@@ -152,6 +171,8 @@ def main() -> None:
         a = atr(rows)
         if not a or a <= 0 or closes[-1] <= 0:
             continue
+        if not stop_ok(ATR_MULT * a / closes[-1], _STOP_CEILING):
+            continue                      # gate would veto this leg every cycle -> lopsided sleeve
         series[sym], atrs[sym], last[sym] = closes, a, closes[-1]
 
     # Clamp the book to what the gate's CURRENT heat budget can carry above the dust floor.
@@ -180,7 +201,8 @@ def main() -> None:
         n_side = max(MIN_N_PER_SIDE, min(args.n_per_side, len(series) // 2))
         heat_note = f"no context - universe-fitted {n_side}/side"
 
-    weights = cross_sectional_weights(series, n_per_side=n_side)
+    weights = cross_sectional_weights(series, n_per_side=n_side,
+                                      vol_floor=VOL_FLOOR, pump_cap=PUMP_CAP)
     rebalancing = (args.cycle % max(1, args.rebalance_every)) == 0
 
     proposals, allocations, management = [], [], []
