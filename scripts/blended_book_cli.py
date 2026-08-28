@@ -93,6 +93,20 @@ def main() -> None:
                                keep_buffer=args.keep_buffer, swap_margin=args.swap_margin,
                                openable=openable)
 
+    # A ROTATION MUST PAY FOR ITSELF. apply_hysteresis rotates on a SCORE margin, which is a
+    # statistical threshold with no notion of what the swap costs. Over the desk's own 353-cycle
+    # record the rank-IC of every traded signal against the next-cycle return is indistinguishable
+    # from noise (blend +0.0010, t=+0.05), so a score-justified rotation has ~zero expected price
+    # income while still paying two taker fills (0.14% round-trip). That is a guaranteed loss, and
+    # it is where the desk's money went: fees of $561 against a gross edge of $564 over 71 days.
+    # This gate re-prices each (close, open) PAIR against its carry and cancels the ones that
+    # cannot repay it. Shrink-only and count-preserving — it can cancel work, never create it.
+    _equity_for_gate = float(ctx.get("equity") or 0.0)
+    if _equity_for_gate > 0:
+        plan = bs.apply_rotation_cost_gate(plan, by_sym, holdings, _equity_for_gate,
+                                           n_per_side=args.n_per_side,
+                                           keepable={s["symbol"] for s in scored})
+
     # DEPLOYMENT TOP-UP: grow frozen-undersized KEPT legs toward the per-leg target (~equity/2 per
     # side) by CLOSE+REOPEN — held legs can't pyramid, so the only gate-respecting way to enlarge a
     # leg is to close it and reopen it fresh at target (cycle.py's explicit-review path opens a

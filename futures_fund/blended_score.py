@@ -23,6 +23,8 @@ from __future__ import annotations
 import math
 from statistics import pstdev
 
+from futures_fund.costs import TAKER_RATE
+
 # Tradeability floors (exclude untradeable pumps / illiquid microcaps / data artifacts).
 MIN_OI_USD = 75e6          # below this notional OI a name is too thin -> NO-TOUCH.
 # Raised 50e6->75e6 (LAB tax): a ~$55-60M name is liquid enough to pass but too thin to size to a
@@ -491,3 +493,102 @@ def admissible_stop_frac(direction: str | None, *, leverage: float = 1.0) -> flo
         liq = liquidation_price(entry, qty, notional / max(leverage, 1e-9), dd, mmr, maint)
         out.append(abs(entry - liq) / entry / MIN_LIQ_DISTANCE_MULT)
     return min(out)
+
+
+# Median observed holding period of a leg over the desk's own 353-cycle record: 4 cycles (16h).
+# DESCRIPTIVE, not fitted — it is how long a leg actually lives, and a SHORT horizon makes the gate
+# STRICTER (less carry credited against the same two fills), which is the conservative direction.
+ROTATION_HOLD_CYCLES = 4
+
+# Assumed price alpha per rotation. ZERO, and that is a measurement, not a placeholder: over 353
+# cycles the rank-IC of every traded signal against the NEXT-cycle return is indistinguishable from
+# noise (momentum_20 +0.0018 t=+0.08, carry -0.0024 t=-0.12, mean-reversion +0.0013 t=+0.06, the
+# live blend +0.0010 t=+0.05). With no price edge, a rotation's only expected income is the funding
+# differential it captures, so carry alone must pay for the two taker fills it costs.
+ROTATION_PRICE_EDGE_BPS = 0.0
+
+
+def apply_rotation_cost_gate(plan: dict, briefs_by_sym: dict, holdings: dict[str, str],
+                             equity: float, n_per_side: int = 3, *,
+                             hold_cycles: int = ROTATION_HOLD_CYCLES,
+                             price_edge_bps: float = ROTATION_PRICE_EDGE_BPS,
+                             slippage_bps: float = 2.0,
+                             keepable: set[str] | None = None) -> dict:
+    """Veto rotations that cannot repay their own round-trip cost (NON-PROTECTED, shrink-only).
+
+    A rotation is a (close incumbent, open challenger) PAIR on the same side. It costs two taker
+    fills; it earns the challenger's funding advantage over the incumbent across `hold_cycles`,
+    plus whatever price edge the caller is willing to assume (default 0 — see
+    ROTATION_PRICE_EDGE_BPS). When cost >= edge the pair is cancelled: the incumbent returns to its
+    keep-sleeve and the challenger's open is dropped.
+
+    `keepable` (optional): symbols that may legitimately be RETAINED — pass the scored set. An
+    incumbent outside it is never resurrected (see the cy340 note inline).
+
+    Only ever CANCELS work — it never opens a leg, never resizes one, and never touches the gate.
+    Side counts are invariant by construction (each cancelled close removes exactly one paired
+    open), so the dollar-neutral book cannot be unbalanced by this function. An UNPAIRED close (a
+    leg that crossed to the other sleeve and must exit) is left alone: there is no open to cancel
+    against it, and resurrecting it would put the book on the wrong side of its own signal.
+    """
+    out = {k: list(v) for k, v in plan.items()}
+    leg_notional = abs(float(equity)) / max(2 * int(n_per_side), 1)
+    if leg_notional <= 0:
+        return out
+    cost = 2.0 * leg_notional * (TAKER_RATE + float(slippage_bps) / 10_000.0)
+    # 4h per cycle; each symbol's OWN funding interval is applied inside _carry_over.
+    hold_hours = max(1.0, float(hold_cycles) * 4.0)
+
+    for side in ("long", "short"):
+        keep_key, open_key = f"keep_{side}", f"open_{side}"
+        challengers = list(out.get(open_key, []))
+        incumbents = [s for s in out.get("close", []) if holdings.get(s) == side]
+        if not challengers or not incumbents:
+            continue
+        # Pair newest-challenger with each exiting incumbent; cancel the pairs that do not pay.
+        for incumbent in list(incumbents):
+            if not challengers:
+                break
+            challenger = challengers[-1]
+            # Both sides of the swap must be PRICEABLE. A stale ex-holding with no brief (cy205)
+            # has no funding rate to value and no downstream structure — keeping it would both
+            # price the swap off a fabricated zero carry and resurrect a leg the rest of the
+            # planner cannot size. Leave such a rotation exactly as apply_hysteresis planned it.
+            if briefs_by_sym.get(incumbent) is None or briefs_by_sym.get(challenger) is None:
+                continue
+            # ...and the incumbent must still be SCORED. A held name that has become untradeable
+            # (a pump: cy340 TRUMP) still HAS a brief but composite_scores drops it, so it has no
+            # score. Keeping it hands a scoreless symbol to the deployment top-up, which turns a
+            # kept leg into a close+reopen and blows up on score_of[sym] downstream. Such a leg is
+            # meant to leave the book — let it.
+            if keepable is not None and incumbent not in keepable:
+                continue
+            edge = (leg_notional * float(price_edge_bps) / 10_000.0
+                    + _carry_over(briefs_by_sym.get(challenger), leg_notional, side, hold_hours)
+                    - _carry_over(briefs_by_sym.get(incumbent), leg_notional, side, hold_hours))
+            challengers.pop()          # consumed either way: one challenger per incumbent
+            if edge > cost:
+                continue
+            out[open_key].remove(challenger)
+            out["close"].remove(incumbent)
+            if incumbent not in out[keep_key]:
+                out[keep_key].append(incumbent)
+    return out
+
+
+def _carry_over(brief: dict | None, notional: float, direction: str, hold_hours: float) -> float:
+    """Signed funding a leg COLLECTS over `hold_hours` (positive = credit to the desk).
+
+    Binance sign convention: funding_rate > 0 => longs pay shorts. Settlements inside the horizon
+    are the symbol's OWN interval (1h/4h/8h all occur in this universe), so a 1h-interval name
+    accrues eight times what an 8h name does over the same wall-clock hold.
+    """
+    if not brief:
+        return 0.0
+    rate = _num(brief.get("funding_rate"))
+    interval = _num(brief.get("funding_interval_hours"), 8.0)
+    if interval <= 0:
+        return 0.0
+    settlements = float(hold_hours) / interval
+    sign = -1.0 if direction == "long" else 1.0
+    return sign * rate * settlements * abs(notional)
