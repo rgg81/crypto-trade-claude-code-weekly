@@ -222,3 +222,13 @@ def test_widening_the_stop_narrows_the_long_short_stop_gap():
     s_short = abs(100.0 - xb.structure(100.0, lo_vol, "short")["stop"]) / 100.0
     s_long = abs(100.0 - xb.structure(100.0, hi_vol, "long")["stop"]) / 100.0
     assert s_long / s_short < 2.0, "stop widths must not differ by more than 2x across sleeves"
+
+
+def test_a_leg_with_no_computed_risk_mult_is_not_given_the_LARGEST_size():
+    """ADVERSARIAL. The CLI did `rm.get(sym, 1.0)`. risk_mults() only emits symbols with a non-zero
+    weight on a side, so any leg it skips would silently be handed rm=1.0 — the MAXIMUM position —
+    rather than a small one. A missing weight must never become the biggest bet on the book."""
+    rm = xb.risk_mults({"A": 0.10, "B": 0.00, "S": -0.10}, {"A": 0.05, "B": 0.05, "S": 0.05})
+    assert "B" not in rm, "a zero-weight leg has no sleeve and must not be sized"
+    assert xb.rm_for("B", rm) < 1.0, "a leg with no computed weight must not get the max size"
+    assert xb.rm_for("A", rm) == pytest.approx(1.0)

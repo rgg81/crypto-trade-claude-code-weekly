@@ -85,6 +85,16 @@ def stop_ok(stop_frac: float, ceiling: float) -> bool:
     return 0.0 < stop_frac < ceiling
 
 
+def rm_for(sym: str, rm: dict[str, float]) -> float:
+    """risk_mult for a leg, defaulting SMALL.
+
+    `risk_mults` only emits symbols carrying a non-zero weight on a side, so a leg it skipped has no
+    entry. Defaulting to 1.0 would hand that leg the LARGEST position on the book — a missing weight
+    silently becoming the biggest bet. Default to the smallest value the gate still accepts instead.
+    """
+    return rm.get(sym, 1e-4)
+
+
 def fit_n_per_side(requested: int, *, priced: int, max_heat: float,
                    dust_frac: float = DUST_FRAC) -> int:
     """Legs per side that BOTH the gate's heat budget and the live universe can support.
@@ -253,7 +263,7 @@ def main() -> None:
             proposals.append({"symbol": sym, "direction": direction, **st,
                               "confidence": round(min(0.9, 0.4 + abs(w) * 8), 3),
                               "horizon_hours": 24, "confirmation": False,
-                              "risk_mult": round(rm.get(sym, 1.0), 4),
+                              "risk_mult": round(rm_for(sym, rm), 4),
                               "rationale": thesis,
                               "falsifiable_prediction": (
                                   f"{sym} out-performs the opposite sleeve while it stays in the "

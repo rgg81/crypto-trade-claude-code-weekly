@@ -203,12 +203,28 @@ def cross_sectional_weights(series_by_sym: dict[str, list[float]], *,
     # truncation (truncating a demeaned book does not preserve the zero sum), and the per-name cap
     # is applied by WATER-FILLING: capping then re-normalising would just push capped names back
     # over the cap, so the excess is redistributed among the uncapped legs until it settles.
-    long_syms = {s for _, s in longs}
+    return size_sleeves(book, {s for _, s in longs}, max_name_frac)
+
+
+def size_sleeves(book: dict[str, float], long_syms: set[str],
+                 max_name_frac: float = MAX_NAME_FRAC) -> dict[str, float]:
+    """Turn scored sleeve members into signed weights, each sleeve carrying half the gross.
+
+    SIZE FROM THE SLEEVE BOUNDARY, NOT FROM |w|. Using |w| silently assumes each sleeve's sign is
+    consistent. Momentum is right-skewed, so after de-meaning the bottom-n can all be POSITIVE — and
+    |w| then makes the WEAKEST short the LARGEST short, inverting the sleeve. Each leg's distance
+    from the midpoint BETWEEN the sleeves is monotone in the score in the right direction for both
+    sides whatever the signs are, and reduces to |w| when the book straddles zero symmetrically
+    (the normal case).
+    """
+    short_syms = set(book) - set(long_syms)
+    if not long_syms or not short_syms:
+        return {}
+    centre = (max(book[s] for s in short_syms) + min(book[s] for s in long_syms)) / 2.0
     out: dict[str, float] = {}
-    for side, members in ((1.0, long_syms), (-1.0, set(book) - long_syms)):
-        # rank within the sleeve carries the size; the raw sign at the boundary does not.
-        legs = {s: abs(book[s]) for s in members}
-        if not any(legs.values()):
+    for side, members in ((1.0, set(long_syms)), (-1.0, short_syms)):
+        legs = {s: max((book[s] - centre) * side, 0.0) for s in members}
+        if not any(v > 0 for v in legs.values()):
             legs = dict.fromkeys(members, 1.0)      # degenerate: equal-weight rather than nothing
         out.update(_waterfill_side(legs, 0.5, max_name_frac, side))
     return out

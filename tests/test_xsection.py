@@ -19,6 +19,7 @@ from futures_fund.xsection import (
     momentum,
     realized_vol,
     returns,
+    size_sleeves,
     zscore_map,
 )
 
@@ -193,3 +194,37 @@ def test_filters_are_off_by_default_so_callers_opt_in():
     panel["GOLDLIKE"] = [100.0 * (1 + 0.00002 * i) for i in range(261)]
     w = cross_sectional_weights(panel, n_per_side=8)
     assert isinstance(w, dict)
+
+
+def test_sleeve_sizing_is_never_inverted_when_a_sleeve_does_not_straddle_zero():
+    """ADVERSARIAL, and my first attempt at this test was VACUOUS — it passed with the bug
+    reintroduced because the synthetic panel never reached the skewed regime. This exercises it
+    directly.
+
+    Sizing a sleeve by |weight| assumes the sleeve's sign is consistent. Momentum is RIGHT-SKEWED
+    (a few sharp losers, many mild winners), so after de-meaning the bottom-n can all be POSITIVE.
+    |w| then makes the WEAKEST short the LARGEST short — exactly backwards. Here every weight is
+    positive: A(0.10) is the most short-favourable and MUST get the biggest short."""
+    book = {"A": 0.10, "B": 0.20, "C": 0.30, "D": 0.40}
+    # max_name_frac must not BIND here, or the water-fill equalises the sleeve and the
+    # test cannot observe the ordering at all (my first version failed for exactly that).
+    w = size_sleeves(book, long_syms={"C", "D"}, max_name_frac=0.5)
+    assert abs(w["A"]) > abs(w["B"]), (
+        f"short sleeve inverted: A={w['A']:.4f} B={w['B']:.4f} (A has the lower score)")
+    assert abs(w["D"]) > abs(w["C"]), (
+        f"long sleeve inverted: D={w['D']:.4f} C={w['C']:.4f} (D has the higher score)")
+    assert w["A"] < 0 and w["B"] < 0 and w["C"] > 0 and w["D"] > 0
+    assert sum(w.values()) == pytest.approx(0.0, abs=1e-9)
+
+
+def test_sleeve_sizing_reduces_to_absolute_weight_when_the_book_straddles_zero():
+    """The normal case must be unchanged by the boundary-relative fix."""
+    book = {"S1": -0.30, "S2": -0.10, "L1": 0.10, "L2": 0.30}
+    w = size_sleeves(book, long_syms={"L1", "L2"}, max_name_frac=0.5)
+    assert abs(w["L2"]) / abs(w["L1"]) == pytest.approx(3.0, rel=1e-6)
+    assert abs(w["S1"]) / abs(w["S2"]) == pytest.approx(3.0, rel=1e-6)
+
+
+def test_size_sleeves_refuses_a_one_sided_book():
+    assert size_sleeves({"A": 0.1, "B": 0.2}, long_syms={"A", "B"}) == {}
+    assert size_sleeves({"A": 0.1, "B": 0.2}, long_syms=set()) == {}
