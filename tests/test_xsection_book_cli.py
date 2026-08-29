@@ -89,14 +89,16 @@ def test_leg_count_adapts_to_the_gates_heat_budget():
     dust floor. consolidate() drops any leg whose risk < 0.001 of equity SILENTLY, so proposing 40
     legs into a 0.02 heat cap (high_vol_range at the caution tier) would quietly delete half the
     book and leave it lopsided — the dust-drop failure family. Cap legs at heat/dust/2 per side."""
-    # healthy low_vol_trend: heat 0.10 -> 100 legs -> 20/side requested is fine
+    # Budgets carry DUST_HEADROOM (see test_leg_budget_leaves_headroom_above_the_dust_floor):
+    # affordable legs = max_heat / (dust * headroom), halved per side.
+    # healthy low_vol_trend: heat 0.10 -> 50 legs -> 25/side, so 20 asked is fine
     assert xb.safe_n_per_side(20, max_heat=0.10, dust_frac=0.001) == 20
-    # caution low_vol_trend: heat 0.05 -> 50 legs -> 20/side (40) still fits
-    assert xb.safe_n_per_side(20, max_heat=0.05, dust_frac=0.001) == 20
-    # caution high_vol_range: heat 0.02 -> 20 legs total -> only 10/side
-    assert xb.safe_n_per_side(20, max_heat=0.02, dust_frac=0.001) == 10
-    # healthy high_vol_range: heat 0.04 -> 40 legs -> exactly 20/side
-    assert xb.safe_n_per_side(20, max_heat=0.04, dust_frac=0.001) == 20
+    # caution low_vol_trend: heat 0.05 -> 25 legs -> 12/side
+    assert xb.safe_n_per_side(20, max_heat=0.05, dust_frac=0.001) == 12
+    # caution high_vol_range: heat 0.02 -> 10 legs -> 5/side
+    assert xb.safe_n_per_side(20, max_heat=0.02, dust_frac=0.001) == 5
+    # healthy high_vol_range: heat 0.04 -> 20 legs -> 10/side
+    assert xb.safe_n_per_side(20, max_heat=0.04, dust_frac=0.001) == 10
 
 
 def test_leg_count_never_exceeds_the_request():
@@ -116,8 +118,8 @@ def test_leg_count_also_adapts_to_a_THIN_universe():
     assert xb.fit_n_per_side(20, priced=100, max_heat=0.10) == 20
     assert xb.fit_n_per_side(20, priced=30, max_heat=0.10) == 15
     assert xb.fit_n_per_side(20, priced=12, max_heat=0.10) == 6
-    # the heat budget still binds when it is the tighter of the two
-    assert xb.fit_n_per_side(20, priced=100, max_heat=0.02) == 10
+    # the heat budget still binds when it is the tighter of the two (0.02 -> 5/side with headroom)
+    assert xb.fit_n_per_side(20, priced=100, max_heat=0.02) == 5
 
 
 def test_thin_universe_still_yields_a_book_not_silence():
@@ -148,3 +150,36 @@ def test_names_with_an_inadmissible_stop_are_dropped_before_the_book_is_built():
     assert not xb.stop_ok(0.54, ceiling)
     assert not xb.stop_ok(ceiling + 1e-6, ceiling)
     assert xb.stop_ok(ceiling - 1e-6, ceiling)
+
+
+def test_leg_budget_leaves_headroom_above_the_dust_floor():
+    """cy360 REGRESSION. Sizing to exactly max_heat/dust legs leaves ZERO margin: consolidate()
+    scales the batch to the heat cap first, so any scaling pushes marginal legs under the floor and
+    they are deleted silently. cy360 asked for 40 legs into a 40-leg budget and got 31. Require
+    each leg to clear the floor with a safety multiple."""
+    # max_heat 0.04 / dust 0.001 = 40 legs raw, but with 2x headroom only 20 total = 10/side
+    assert xb.safe_n_per_side(20, max_heat=0.04, dust_frac=0.001) == 10
+    assert xb.safe_n_per_side(20, max_heat=0.10, dust_frac=0.001) == 20   # healthy: 50 -> 20 asked
+    assert xb.safe_n_per_side(20, max_heat=0.02, dust_frac=0.001) == 5
+
+
+def test_risk_mult_is_normalised_PER_SLEEVE():
+    """cy360 REGRESSION. Normalising rm across the WHOLE book couples the two sleeves: momentum is
+    right-skewed, so the long sleeve carries larger |z| than the short, every short leg gets a
+    smaller rm, and the shorts are the ones dust-dropped (7 of 9 lost legs at cy360). Each sleeve
+    must get its own budget so neither side is starved by the other's signal strength."""
+    w = {"L1": 0.20, "L2": 0.05, "S1": -0.02, "S2": -0.01}
+    sf = dict.fromkeys(w, 0.05)
+    rm = xb.risk_mults(w, sf)
+    assert max(rm["L1"], rm["L2"]) == pytest.approx(1.0), "long sleeve must reach 1.0"
+    assert max(rm["S1"], rm["S2"]) == pytest.approx(1.0), "short sleeve must reach 1.0 too"
+    # and within a sleeve the ordering is preserved
+    assert rm["L1"] > rm["L2"] and rm["S1"] > rm["S2"]
+
+
+def test_per_sleeve_normalisation_keeps_relative_weights_inside_a_sleeve():
+    w = {"L1": 0.10, "L2": 0.05, "S1": -0.10, "S2": -0.05}
+    sf = dict.fromkeys(w, 0.05)
+    rm = xb.risk_mults(w, sf)
+    assert rm["L2"] / rm["L1"] == pytest.approx(0.5)
+    assert rm["S2"] / rm["S1"] == pytest.approx(0.5)

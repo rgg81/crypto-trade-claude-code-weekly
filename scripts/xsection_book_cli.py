@@ -43,6 +43,10 @@ _STOP_CEILING = admissible_stop_frac(None)
 # consolidate() drops any leg whose risk falls below this fraction of equity, SILENTLY.
 DUST_FRAC = 0.001
 MIN_N_PER_SIDE = 3
+# Headroom over the dust floor. consolidate() scales the whole batch to the heat cap BEFORE the
+# floor is applied, so sizing to exactly max_heat/dust legs leaves no margin and any scaling deletes
+# the marginal ones. cy360 asked for 40 legs into a 40-leg budget and executed 31.
+DUST_HEADROOM = 2.0
 
 
 def safe_n_per_side(requested: int, *, max_heat: float, dust_frac: float = DUST_FRAC) -> int:
@@ -56,7 +60,7 @@ def safe_n_per_side(requested: int, *, max_heat: float, dust_frac: float = DUST_
     """
     if dust_frac <= 0:
         return max(MIN_N_PER_SIDE, requested)
-    affordable = int(max(0.0, max_heat) / dust_frac) // 2
+    affordable = int(max(0.0, max_heat) / (dust_frac * DUST_HEADROOM)) // 2
     return max(MIN_N_PER_SIDE, min(int(requested), affordable))
 
 
@@ -127,14 +131,22 @@ def risk_mults(weights: dict[str, float], stop_frac: dict[str, float]) -> dict[s
 
     The gate sizes by RISK, not notional: notional = (equity * ptr * rm) / stop_frac. So to land a
     notional proportional to the target weight, rm must be proportional to weight * stop_frac.
-    Normalised so the largest leg is exactly 1.0 — rm is clamped to (0,1] by the gate, so scaling
-    any other way would silently truncate the book's biggest position.
+    Normalised PER SLEEVE so the largest leg on EACH side is exactly 1.0. Normalising across the
+    whole book couples the sleeves: momentum is right-skewed, so the long sleeve carries larger |z|,
+    every short gets a proportionally smaller rm, and the shorts are the legs that fall under the
+    dust floor — 7 of the 9 legs lost at cy360 were shorts. Per-sleeve budgets stop one side's
+    signal strength from starving the other. rm is clamped to (0,1] by the gate, so scaling any
+    other way would also silently truncate the book's biggest position.
     """
-    raw = {s: abs(w) * stop_frac.get(s, 0.0) for s, w in weights.items()}
-    top = max(raw.values(), default=0.0)
-    if top <= 0:
-        return {}
-    return {s: max(1e-4, min(1.0, v / top)) for s, v in raw.items()}
+    out: dict[str, float] = {}
+    for side in (1.0, -1.0):
+        legs = {s: abs(w) * stop_frac.get(s, 0.0)
+                for s, w in weights.items() if w * side > 0}
+        top = max(legs.values(), default=0.0)
+        if top <= 0:
+            continue
+        out.update({s: max(1e-4, min(1.0, v / top)) for s, v in legs.items()})
+    return out
 
 
 def main() -> None:
