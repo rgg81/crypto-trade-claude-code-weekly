@@ -31,7 +31,17 @@ from futures_fund.xsection import (
 PROXY = os.environ.get("BINANCE_KLINES_PROXY", "http://127.0.0.1:8000")
 BARS = 300                # >= MOM_LOOKBACK + BETA window headroom
 ATR_LEN = 14
-ATR_MULT = 2.0
+# STOP WIDTH. The validated backtest held legs until the SIGNAL changed; a 2xATR stop replayed over
+# the same panel INVERTS the strategy (sharpe +2.33 unstopped -> -1.63 at 2xATR, 734 stop-outs), and
+# refilling faster does not rescue it. Momentum legs get stopped on ordinary noise and then sit out
+# until the next rebalance. The gate REQUIRES a stop, so it is placed far enough out that the signal
+# closes a leg, not noise. Monotone: 2x -> -1.63, 4x -> +0.49, 8x -> +1.42, none -> +2.33.
+ATR_MULT = 8.0
+# ...but CAPPED, not multiplied without limit: 8xATR on a high-ATR name would exceed the gate's
+# admissible stop and stop_ok would drop the name entirely, biasing the book toward low-vol names.
+# Capping keeps it. It also compresses the long/short stop gap that caused the asymmetric attrition
+# (shorts are low-ATR majors, longs high-ATR microcaps; at 2xATR short stops were ~45% tighter).
+STOP_CAP = 0.30
 # Take-profits sit FAR out (6R/10R). The gate demands RR >= 2 on every proposal, but a factor leg
 # should be closed by the SIGNAL leaving its sleeve, not by a price target — a near TP would
 # truncate winners and quietly convert the book into something else.
@@ -115,7 +125,7 @@ def atr(rows: list[list], length: int = ATR_LEN) -> float | None:
 
 
 def structure(entry: float, atr_v: float, direction: str) -> dict:
-    risk = ATR_MULT * atr_v
+    risk = min(ATR_MULT * atr_v, STOP_CAP * entry)
     if direction == "long":
         stop = entry - risk
         tps = [round(entry + RR1 * risk, 8), round(entry + RR2 * risk, 8)]
@@ -183,7 +193,7 @@ def main() -> None:
         a = atr(rows)
         if not a or a <= 0 or closes[-1] <= 0:
             continue
-        if not stop_ok(ATR_MULT * a / closes[-1], _STOP_CEILING):
+        if not stop_ok(min(ATR_MULT * a / closes[-1], STOP_CAP), _STOP_CEILING):
             continue                      # gate would veto this leg every cycle -> lopsided sleeve
         series[sym], atrs[sym], last[sym] = closes, a, closes[-1]
 

@@ -183,3 +183,42 @@ def test_per_sleeve_normalisation_keeps_relative_weights_inside_a_sleeve():
     rm = xb.risk_mults(w, sf)
     assert rm["L2"] / rm["L1"] == pytest.approx(0.5)
     assert rm["S2"] / rm["S1"] == pytest.approx(0.5)
+
+
+def test_stops_are_wide_enough_that_noise_does_not_close_a_factor_leg():
+    """cy360-364 REGRESSION, and the most damaging bug so far. The validated backtest held every leg
+    until the SIGNAL changed; the shipped desk stopped legs out at 2xATR. Replayed over 100 names x
+    2190 bars that single difference INVERTS the strategy:
+
+        no stops  sharpe +2.33 (+6.29%/mo)   0 stop-outs
+        8xATR     sharpe +1.42 (+3.62%/mo)  51 stop-outs
+        4xATR     sharpe +0.49 (+0.91%/mo) 205 stop-outs
+        2xATR     sharpe -1.63 (-4.83%/mo) 734 stop-outs   <-- what shipped
+
+    Monotone in stop-outs: momentum legs get stopped on ordinary noise, then sit out until the
+    next rebalance, so the desk sells the dip and misses the recovery. Refilling faster does not
+    rescue it (2xATR at every=1 is still only +0.15). The gate REQUIRES a stop, so make it wide
+    enough that the signal, not noise, closes the leg."""
+    assert xb.ATR_MULT >= 8.0, "a 2xATR stop inverts this strategy"
+
+
+def test_stop_is_capped_below_the_gate_ceiling_instead_of_excluding_the_name():
+    """A pure multiple over-filters: 8xATR on a 5%-ATR name is 40%, past the gate's admissible stop,
+    so stop_ok would reject it and bias the book toward low-vol names. Cap the stop instead."""
+    from futures_fund.blended_score import admissible_stop_frac
+    ceiling = admissible_stop_frac(None)
+    assert xb.STOP_CAP < ceiling, "the cap must sit inside the gate's liq-distance ceiling"
+    # a very high-ATR name is capped, not dropped
+    st = xb.structure(100.0, 20.0, "long")          # 20% ATR -> 8x would be 160%
+    assert abs(st["entry"] - st["stop"]) / st["entry"] == pytest.approx(xb.STOP_CAP, abs=1e-9)
+
+
+def test_widening_the_stop_narrows_the_long_short_stop_gap():
+    """The asymmetric attrition (3 shorts lost vs 1 long over cy360-364) came from the factor
+    longing high-ATR microcaps and shorting low-ATR majors: at 2xATR the short stops were ~45%
+    tighter, so shorts were picked off first and the guard had to shrink the long sleeve to restore
+    neutrality. Capping the wide side compresses that gap."""
+    lo_vol, hi_vol = 3.0, 12.0                       # ATR as % of a 100 price
+    s_short = abs(100.0 - xb.structure(100.0, lo_vol, "short")["stop"]) / 100.0
+    s_long = abs(100.0 - xb.structure(100.0, hi_vol, "long")["stop"]) / 100.0
+    assert s_long / s_short < 2.0, "stop widths must not differ by more than 2x across sleeves"
