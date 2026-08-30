@@ -232,3 +232,46 @@ def test_a_leg_with_no_computed_risk_mult_is_not_given_the_LARGEST_size():
     assert "B" not in rm, "a zero-weight leg has no sleeve and must not be sized"
     assert xb.rm_for("B", rm) < 1.0, "a leg with no computed weight must not get the max size"
     assert xb.rm_for("A", rm) == pytest.approx(1.0)
+
+
+def test_held_legs_with_a_STALE_tight_stop_are_re_struck():
+    """cy369 REGRESSION. Widening the stop only affects NEWLY OPENED legs — a held leg keeps
+    whatever stop it was booked with. After the 2xATR -> 8xATR fix the live book was bimodal: 11 new
+    legs at a 30.0% median stop and 8 legacy legs at 8.7%, and it was a LEGACY leg (LAB) that was
+    stopped out first, costing a leg and forcing a neutrality trim that shrank the book.
+
+    A leg whose stop is materially tighter than current policy carries the exact exposure the policy
+    change removed, so it must be re-struck rather than left to bleed out. The whole migration is 8
+    legs x 2 fills x ~$110 x 0.07% ~ $1.23 — far cheaper than one avoidable stop-out."""
+    live = {"OLD1": 0.054, "OLD2": 0.087, "NEW1": 0.300, "NEW2": 0.138}
+    want = {"OLD1": 0.30, "OLD2": 0.30, "NEW1": 0.30, "NEW2": 0.15}
+    out = xb.stale_stop_restrikes(live, want, tolerance=0.5)
+    assert "OLD1" in out and "OLD2" in out, "legacy tight stops must be re-struck"
+    assert "NEW1" not in out, "a leg already at policy must not churn"
+    assert "NEW2" not in out, "a leg inside tolerance must not churn"
+
+
+def test_restrike_never_fires_on_a_leg_whose_stop_is_WIDER_than_policy():
+    """Only a TIGHTER-than-policy stop carries the harmful exposure. A wider one is harmless and
+    re-striking it would be pure fee."""
+    out = xb.stale_stop_restrikes({"WIDE": 0.30}, {"WIDE": 0.10}, tolerance=0.5)
+    assert out == set()
+
+
+def test_restrike_is_silent_without_the_data_it_needs():
+    assert xb.stale_stop_restrikes({}, {}, tolerance=0.5) == set()
+    assert xb.stale_stop_restrikes({"A": 0.05}, {}, tolerance=0.5) == set()
+
+
+def test_risk_mult_uses_the_stop_ACTUALLY_placed_not_the_uncapped_one():
+    """The cap introduced a mismatch: rm was computed from the raw ATR_MULT*atr/price while
+    structure() places min(that, STOP_CAP). Since notional = equity*ptr*rm/stop_frac, sizing a leg
+    off a 40% stop while placing a 30% one over-sizes it by 33%. Both must use the placed stop."""
+    entry, atr_v = 100.0, 10.0                    # 8x ATR = 80% -> capped to STOP_CAP
+    st = xb.structure(entry, atr_v, "long")
+    placed = abs(st["entry"] - st["stop"]) / st["entry"]
+    assert placed == pytest.approx(xb.STOP_CAP)
+    assert xb.placed_stop_frac(entry, atr_v) == pytest.approx(placed), (
+        "the stop_frac fed to risk_mults must equal the stop structure() actually places")
+    # and an uncapped leg is unchanged
+    assert xb.placed_stop_frac(100.0, 1.0) == pytest.approx(0.08)

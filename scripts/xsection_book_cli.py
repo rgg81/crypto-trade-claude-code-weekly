@@ -17,6 +17,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import sys
 import urllib.parse
 import urllib.request
 
@@ -85,6 +86,28 @@ def stop_ok(stop_frac: float, ceiling: float) -> bool:
     return 0.0 < stop_frac < ceiling
 
 
+def stale_stop_restrikes(live_stop_frac: dict[str, float], policy_stop_frac: dict[str, float],
+                         *, tolerance: float = 0.5) -> set[str]:
+    """Held legs whose stop is materially TIGHTER than current policy would set.
+
+    Widening the stop only affects newly OPENED legs; a held leg keeps the stop it was booked with.
+    After the 2xATR -> 8xATR change the live book was bimodal (11 new legs at a 30.0% median stop,
+    8 legacy legs at 8.7%) and it was a legacy leg that stopped out first — costing a leg and
+    forcing a neutrality trim that shrank the book. Such a leg still carries the exposure the policy
+    change was made to remove, so re-strike it.
+
+    Only TIGHTER-than-policy stops qualify: a wider stop is harmless and re-striking it is pure fee.
+    """
+    out = set()
+    for sym, live in live_stop_frac.items():
+        want = policy_stop_frac.get(sym)
+        if not want or not live or live <= 0:
+            continue
+        if live < want * max(0.0, min(1.0, tolerance)):
+            out.add(sym)
+    return out
+
+
 def rm_for(sym: str, rm: dict[str, float]) -> float:
     """risk_mult for a leg, defaulting SMALL.
 
@@ -132,6 +155,15 @@ def atr(rows: list[list], length: int = ATR_LEN) -> float | None:
         trs.append(max(h - low, abs(h - pc), abs(low - pc)))
     window = trs[-length:]
     return sum(window) / len(window) if window else None
+
+
+def placed_stop_frac(entry: float, atr_v: float) -> float:
+    """The stop distance structure() ACTUALLY places, as a fraction of entry.
+
+    risk_mults must use this, not the raw multiple: the gate sizes notional = equity*ptr*rm/stop,
+    so feeding an UNCAPPED 8xATR figure while placing a capped 30% stop over-sizes that leg.
+    """
+    return min(ATR_MULT * atr_v / entry, STOP_CAP) if entry > 0 else 0.0
 
 
 def structure(entry: float, atr_v: float, direction: str) -> dict:
@@ -241,12 +273,21 @@ def main() -> None:
     plan = {"target_long": [], "target_short": [], "open": [], "close": [], "hold": []}
 
     if weights and rebalancing:
-        stop_frac = {s: ATR_MULT * atrs[s] / last[s] for s in weights}
+        stop_frac = {s: placed_stop_frac(last[s], atrs[s]) for s in weights}
         rm = risk_mults(weights, stop_frac)
+        # Held legs booked under an older, TIGHTER stop policy still carry the exposure that policy
+        # change removed (cy369: a legacy 2xATR leg stopped out and forced a neutrality trim). Close
+        # and reopen them at the current stop; the whole migration costs ~2 fills per stale leg.
+        _live_stop = {p["symbol"]: abs(float(p["stop"]) - float(p["entry"])) / float(p["entry"])
+                      for p in positions
+                      if p.get("entry") and float(p["entry"]) > 0 and p.get("stop")}
+        _restrike = stale_stop_restrikes(_live_stop, stop_frac)
+        if _restrike:
+            print(json.dumps({"stale_stop_restrike": sorted(_restrike)}), file=sys.stderr)
         for sym, w in sorted(weights.items(), key=lambda kv: -abs(kv[1])):
             direction = "long" if w > 0 else "short"
             (plan["target_long"] if w > 0 else plan["target_short"]).append(sym)
-            if holdings.get(sym) == direction:
+            if holdings.get(sym) == direction and sym not in _restrike:
                 plan["hold"].append(sym)
                 management.append({"symbol": sym, "action": "hold",
                                    "note": f"factor weight {w:+.4f} still on the {direction} side"})
