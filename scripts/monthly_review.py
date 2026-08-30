@@ -469,6 +469,44 @@ def check_neutrality_compliance(cycles: list[dict], state_dir: Path) -> dict:
     }
 
 
+def active_book_engine(driver_path) -> str:
+    """Which book engine the DRIVER actually calls — read, never assumed.
+
+    The desk was converted from the blended 3-leg book to the cross-sectional factor book. This
+    review is blended-specific (its title, its weights, and its atr_mult replay all describe that
+    strategy), so it must know when it is auditing something that no longer runs.
+    """
+    try:
+        src = Path(driver_path).read_text()
+    except OSError:
+        return "unknown"
+    if "xsection_book_cli" in src:
+        return "xsection"
+    if "blended_book_cli" in src:
+        return "blended"
+    return "unknown"
+
+
+def gate_stop_recommendation(rec: dict, *, engine: str) -> dict:
+    """Suppress the atr_mult proposal unless the blended book is the LIVE one.
+
+    The replay measures the stop of the BLENDED book. Against the factor desk the number is not
+    merely irrelevant, it points the WRONG WAY: a tight stop is exactly the defect that inverted
+    that strategy (2xATR -> sharpe -1.63 against +2.33 unstopped), which is why the factor desk runs
+    8xATR capped. cy366's review recommended 0.75xATR. Keep the measurement for the record, but do
+    not present it as a recommendation for a desk it does not describe.
+    """
+    if engine == "blended":
+        return dict(rec)
+    out = {k: v for k, v in rec.items() if k not in ("recommend", "expected_gain")}
+    out["recommend"] = None
+    out["suppressed_because"] = (
+        f"live book engine is '{engine}', not 'blended'; this atr_mult replay describes the "
+        f"blended book's stop and must not be applied to the factor desk")
+    out["measured_for_blended"] = dict(rec)
+    return out
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--days", type=int, default=60,
@@ -559,6 +597,15 @@ def main():
     except Exception as e:  # noqa: BLE001 — an optional study must never wedge the review
         stop_v = {"recommend": None, "expected_gain": 0.0, "reason": f"replay failed: {e}"[:200],
                   "candidates": {}, "caveat": _STOP_CAVEAT}
+    # This whole review describes the BLENDED book. If the driver runs a different engine, its
+    # atr_mult proposal does not merely fail to apply — it points the WRONG WAY (cy366 recommended
+    # 0.75xATR while the live factor desk runs 8xATR precisely because a tight stop inverts it).
+    _engine = active_book_engine(Path(__file__).with_name("auto_cycle.py"))
+    stop_v = gate_stop_recommendation(stop_v, engine=_engine)
+    if _engine != "blended":
+        print(f"\n*** STALE REVIEW: the live book engine is '{_engine}', not 'blended'. This "
+              f"review validates the RETIRED blended score; its weight and stop proposals do NOT "
+              f"describe the running desk and must not be applied to it. ***")
     if stop_v["candidates"]:
         print(f"\nStop distance (live atr_mult={args.live_atr_mult}):")
         for m in sorted(stop_v["candidates"]):
@@ -566,9 +613,15 @@ def main():
             mark = "OK " if s["consistent"] else "noise"
             print(f"  {m:>4}x  total {s['total']:>+9.2f}  "
                   f"halves {s['first_half']:>+9.2f} / {s['second_half']:>+9.2f}  [{mark}]")
-        _verdict = (f"change to {stop_v['recommend']}" if stop_v["recommend"]
-                    else "NO CHANGE")
-        print(f"  verdict: {_verdict} — {stop_v['reason']}")
+        if stop_v.get("suppressed_because"):
+            _m = stop_v.get("measured_for_blended", {})
+            print(f"  verdict: SUPPRESSED — {stop_v['suppressed_because']}")
+            print(f"           (replay would have said {_m.get('recommend')}x for the blended "
+                  f"book: {_m.get('reason', '')})")
+        else:
+            _verdict = (f"change to {stop_v['recommend']}" if stop_v["recommend"]
+                        else "NO CHANGE")
+            print(f"  verdict: {_verdict} — {stop_v['reason']}")
         print(f"  caveat: {stop_v['caveat']}")
 
     # Analyze rotation pattern
