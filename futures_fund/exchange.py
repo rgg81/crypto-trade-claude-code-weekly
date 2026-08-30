@@ -17,6 +17,45 @@ from futures_fund.market_data import (
 )
 from futures_fund.models import MmrBracket, SymbolSpec
 
+# NETWORK RESILIENCE. cy368 and cy370 both died on a mid-gate TimeoutError — two lost cycles out of
+# three DUE ticks. The gate makes ~20 sequential UNPROXIED calls (mark_price -> fetch_funding_rate,
+# one per position) and ccxt defaults to a 10s timeout with no retry, so a single slow response
+# under the shared-IP load aborts the whole cycle. State stayed clean (the HOLD path works), but the
+# cycle is still lost.
+CLIENT_TIMEOUT_MS = 30_000
+RETRYABLE_ATTEMPTS = 2
+_RETRY_BACKOFF_S = 1.5
+# A rate-limit BAN must never be retried: each call during one re-extends it ~22 minutes,
+# the single worst thing this desk can do to itself. Only transient transport faults qualify.
+_BAN_MARKERS = ("418", "-1003", "429", "too many requests", "banned")
+
+
+def is_retryable(exc: BaseException) -> bool:
+    """True only for a transient TRANSPORT fault — never for a ban, never for a bug."""
+    msg = str(exc).lower()
+    if any(m in msg for m in _BAN_MARKERS):
+        return False
+    if isinstance(exc, TimeoutError | ConnectionError):
+        return True
+    return any(w in msg for w in ("timed out", "timeout", "connection reset",
+                                  "connection aborted", "temporarily unavailable"))
+
+
+def with_retry(fn, *, attempts: int = RETRYABLE_ATTEMPTS, sleep=None):
+    """Call `fn`, retrying ONLY transient transport faults, at most `attempts` times total."""
+    import time as _time
+    _sleep = sleep if sleep is not None else _time.sleep
+    last: BaseException | None = None
+    for i in range(max(1, attempts)):
+        try:
+            return fn()
+        except BaseException as exc:  # noqa: BLE001 — re-raised below unless retryable
+            last = exc
+            if not is_retryable(exc) or i == max(1, attempts) - 1:
+                raise
+            _sleep(_RETRY_BACKOFF_S * (i + 1))
+    raise last  # pragma: no cover - loop always returns or raises
+
 
 def build_ccxt(settings: Settings):
     """Construct a ccxt binanceusdm client. Imported lazily so the test suite never needs
@@ -29,7 +68,7 @@ def build_ccxt(settings: Settings):
     """
     import ccxt
 
-    config: dict = {"enableRateLimit": True}
+    config: dict = {"enableRateLimit": True, "timeout": CLIENT_TIMEOUT_MS}
     if settings.live:
         if not settings.exchange.api_key or not settings.exchange.api_secret:
             raise ValueError(
@@ -112,7 +151,7 @@ class FuturesExchange:
         market = self.client.market(symbol)
         if self.keyless:
             return default_symbol_spec(market)  # paper: no auth for leverage tiers
-        tiers = self.client.fetch_leverage_tiers([symbol])[symbol]
+        tiers = with_retry(lambda: self.client.fetch_leverage_tiers([symbol]))[symbol]
         return parse_symbol_spec(market, tiers)
 
     def ohlcv(self, symbol: str, timeframe: str = "4h", limit: int = 500) -> pd.DataFrame:
@@ -132,7 +171,9 @@ class FuturesExchange:
         return parse_ohlcv(self.client.fetch_ohlcv(symbol, timeframe, None, limit))
 
     def funding(self, symbol: str) -> FundingInfo:
-        fr = self.client.fetch_funding_rate(symbol)
+        # UNPROXIED and called once per symbol — the burst that cost cy368/cy370. A transient
+        # timeout here is retried once; a BAN is never retried (see is_retryable).
+        fr = with_retry(lambda: self.client.fetch_funding_rate(symbol))
         try:
             interval = self.client.fetch_funding_interval(symbol)
         except Exception:
@@ -154,4 +195,4 @@ class FuturesExchange:
         return parse_long_short_ratio(raw)
 
     def mark_price(self, symbol: str) -> float:
-        return float(self.client.fetch_funding_rate(symbol)["markPrice"])
+        return float(with_retry(lambda: self.client.fetch_funding_rate(symbol))["markPrice"])
