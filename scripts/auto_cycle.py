@@ -156,9 +156,15 @@ def _held_symbols() -> list[str]:
     return [_ccxt(x["symbol"]) for x in json.load(open(p))]
 
 
-def _book():
+def _live_positions() -> list:
+    """positions.json as a list — the desk's actual book, independent of any cycle report."""
     p = os.path.join(ROOT, "state", "positions.json")
     ps = json.load(open(p)) if os.path.exists(p) else []
+    return ps if isinstance(ps, list) else ps.get("positions", [])
+
+
+def _book():
+    ps = _live_positions()
     longs = [x["symbol"].replace("USDT", "") for x in ps if x["direction"] == "long"]
     shorts = [x["symbol"].replace("USDT", "") for x in ps if x["direction"] == "short"]
     return longs, shorts
@@ -507,6 +513,47 @@ def _guard_outcome_line(rep2, tilt_before: float) -> str:
             f"L{exp['n_long']}/S{exp['n_short']}")
 
 
+def exposure_from_positions(positions) -> dict:
+    """Book exposure computed straight from positions.json — no gate, no network.
+
+    The post-gate guard reads the gate's report. When the gate DIES mid-execute there is no report,
+    so the guard is skipped entirely — and a rebalance that applied its closes before dying leaves
+    the book badly one-sided with nothing checking it. cy372 ended L6/S9 at 23.65% net short exactly
+    that way. Neutrality is the mandate's hard invariant, so it needs a source of truth that does
+    not depend on the gate having finished.
+    """
+    gl = gs = 0.0
+    nl = ns = 0
+    for p in positions or []:
+        try:
+            notional = abs(float(p.get("qty") or 0.0)) * float(p.get("entry") or 0.0)
+        except (TypeError, ValueError):
+            continue
+        if str(p.get("direction", "")).lower().startswith("l"):
+            gl += notional
+            nl += 1
+        else:
+            gs += notional
+            ns += 1
+    gross = gl + gs
+    return {"gross_long": gl, "gross_short": gs, "net": gl - gs, "gross": gross,
+            "tilt": (abs(gl - gs) / gross) if gross > 0 else 0.0,
+            "n_long": nl, "n_short": ns}
+
+
+def neutrality_alarm(exposure) -> str:
+    """A loud, explicit line when the book is off-neutral — or "" when it is fine.
+
+    Silence is how cy372's 23.65% net short went unremarked: the outage line reported the held book
+    and looked routine. HARD RULE 8 — surface the flag without being asked.
+    """
+    if not _guard_should_trim(exposure):
+        return ""
+    return (f"  *** NEUTRALITY BREACH: tilt {exposure['tilt']:.4f} "
+            f"(net ${exposure['net']:+,.0f}, L{exposure['n_long']}/S{exposure['n_short']}) — the "
+            f"gate died mid-execute leaving the book one-sided; the next tick re-strikes it. ***")
+
+
 def _guard_should_trim(exposure) -> bool:
     """Trim only when the DOLLARS are out of band — never on a leg-count mismatch alone.
 
@@ -752,6 +799,13 @@ def main() -> int:
         print(f"HOLD-ON-DATA-OUTAGE cycle {cycle}: gate produced no report (rate-limit/network "
               f"mid-execute, or a parse issue) — book held, retry next tick. "
               f"LONG {'/'.join(longs)} vs SHORT {'/'.join(shorts)} | {_pnl_line()}")
+        # "Book held" is only true when the gate died before touching anything. On a REBALANCE it
+        # can die AFTER its closes and before its opens, leaving the book badly one-sided — cy372
+        # ended L6/S9 at 23.65% net short and said nothing, because the post-gate guard reads a
+        # report that was never written. Measure the real book and shout if neutrality broke.
+        _alarm = neutrality_alarm(exposure_from_positions(_live_positions()))
+        if _alarm:
+            print(_alarm)
         return _exit_code(longs, shorts)
     e = rep["exposure"]
     print(f"gate: opened {rep['opened']} closed {rep['closed']} reduced {rep['reduced']} | "
