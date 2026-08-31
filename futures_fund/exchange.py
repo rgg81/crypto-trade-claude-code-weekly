@@ -194,5 +194,36 @@ class FuturesExchange:
         )
         return parse_long_short_ratio(raw)
 
+    def mark_prices(self, symbols) -> dict[str, float]:
+        """Marks for many symbols in ONE call.
+
+        WHY THIS EXISTS. Gate timeouts clustered with total precision at Binance's 8-hourly funding
+        settlement — 00:00/08:00/16:00 UTC failed (cy368, cy370, cy372, cy374), 04:00/12:00/20:00
+        succeeded (cy366/367/369/371/373); 4-for-4 and 5-for-5. The book was priced with ~20
+        SEQUENTIAL fetch_funding_rate calls, hitting the funding endpoint exactly when every perp on
+        the venue settles and the neighbour fleet recalculates. One batch call collapses that window
+        and stops this desk adding to the same spike.
+
+        A symbol the venue omits is ABSENT from the result, never 0.0 — pricing a live position at
+        nothing is far worse than reporting it unpriceable.
+        """
+        wanted = [s for s in (symbols or []) if s]
+        if not wanted:
+            return {}
+        batch = getattr(self.client, "fetch_mark_prices", None)
+        if callable(batch):
+            raw = with_retry(lambda: batch(wanted)) or {}
+            out = {}
+            for sym in wanted:
+                row = raw.get(sym) or {}
+                px = row.get("markPrice") if isinstance(row, dict) else None
+                if px is not None:
+                    try:
+                        out[sym] = float(px)
+                    except (TypeError, ValueError):
+                        continue
+            return out
+        return {s: self.mark_price(s) for s in wanted}
+
     def mark_price(self, symbol: str) -> float:
         return float(with_retry(lambda: self.client.fetch_funding_rate(symbol))["markPrice"])

@@ -39,14 +39,28 @@ def position_marks(exchange, positions) -> tuple[dict[str, float], list[str]]:
     or a transient data error) and are therefore NOT watched — the caller must surface them."""
     marks: dict[str, float] = {}
     unpriced: list[str] = []
-    for p in positions:
-        unified = exchange.unified_for_raw(p.symbol)
-        mark = None
-        if unified is not None:
+    # ONE batch call, not one per position. The per-position loop was ~20 sequential
+    # fetch_funding_rate calls and every gate timeout landed on a funding-settlement hour
+    # (00/08/16 UTC failed, 04/12/20 succeeded — see exchange.mark_prices).
+    unified_by_raw = {p.symbol: exchange.unified_for_raw(p.symbol) for p in positions}
+    wanted = [u for u in unified_by_raw.values() if u is not None]
+    batch = getattr(exchange, "mark_prices", None)
+    by_unified: dict[str, float] = {}
+    if callable(batch):
+        try:
+            by_unified = batch(wanted) or {}
+        except Exception:  # noqa: BLE001 — a failed batch leaves everything unpriceable, as before
+            by_unified = {}
+    else:
+        # An exchange without the batch endpoint (or a test double) still works, one call per name.
+        for u in wanted:
             try:
-                mark = exchange.mark_price(unified)
-            except Exception:  # noqa: BLE001 — transient data error -> treat as unpriceable
-                mark = None
+                by_unified[u] = exchange.mark_price(u)
+            except Exception:  # noqa: BLE001 — transient data error -> unpriceable
+                continue
+    for p in positions:
+        unified = unified_by_raw.get(p.symbol)
+        mark = by_unified.get(unified) if unified is not None else None
         if mark is not None and mark > 0:
             marks[p.symbol] = float(mark)
         else:
