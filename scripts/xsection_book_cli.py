@@ -108,6 +108,22 @@ def stale_stop_restrikes(live_stop_frac: dict[str, float], policy_stop_frac: dic
     return out
 
 
+def fallback_max_heat(health) -> float:
+    """The tightest max_heat ANY regime quadrant could impose at this health tier.
+
+    The desk's context carries `regime_state.regime` ("risk_off"), not `quadrant`, so the quadrant
+    is usually UNKNOWN here. Guessing optimistically is the wrong direction for a SAFETY limit: at
+    cy384 an assumed `low_vol_range` (max_heat 0.04) sized 10 legs/side, the gate enforced 0.020,
+    and two legs were VETOED for no heat headroom leaving the book L9/S10. Too FEW legs still
+    executes; too many comes out lopsided. Derived from policy's own table so a caps change flows
+    through instead of drifting.
+    """
+    from futures_fund.models import RegimeState
+    from futures_fund.policy import _BASE_CAPS, caps_for
+    return min(caps_for(RegimeState(quadrant=q, trend="up", vol="low"), health).max_heat
+               for q in _BASE_CAPS)
+
+
 def rm_for(sym: str, rm: dict[str, float]) -> float:
     """risk_mult for a leg, defaulting SMALL.
 
@@ -252,11 +268,16 @@ def main() -> None:
             eq = float(ctx.get("equity") or 0.0)
             health = PortfolioHealth(equity=eq, peak_equity=eq / (1 - dd) if dd < 1 else eq,
                                      drawdown_from_peak=dd)
-            quad = (ctx.get("regime_state") or {}).get("quadrant") or "low_vol_range"
-            caps = caps_for(RegimeState(quadrant=quad, trend="up", vol="low"), health)
-            n_side = fit_n_per_side(args.n_per_side, priced=len(series),
-                                    max_heat=caps.max_heat)
-            heat_note = (f"max_heat {caps.max_heat:.4f} @ {health.tier}, priced {len(series)} -> "
+            quad = (ctx.get("regime_state") or {}).get("quadrant")
+            if quad:
+                _heat = caps_for(RegimeState(quadrant=quad, trend="up", vol="low"),
+                                 health).max_heat
+                _src = f"quadrant {quad}"
+            else:
+                _heat = fallback_max_heat(health)
+                _src = "quadrant UNKNOWN -> strictest budget"
+            n_side = fit_n_per_side(args.n_per_side, priced=len(series), max_heat=_heat)
+            heat_note = (f"max_heat {_heat:.4f} @ {health.tier} ({_src}), priced {len(series)} -> "
                          f"{n_side} legs/side (asked {args.n_per_side})")
         except Exception as exc:  # noqa: BLE001 - never let a caps read stop the book
             n_side = max(MIN_N_PER_SIDE, min(args.n_per_side, len(series) // 2))

@@ -275,3 +275,34 @@ def test_risk_mult_uses_the_stop_ACTUALLY_placed_not_the_uncapped_one():
         "the stop_frac fed to risk_mults must equal the stop structure() actually places")
     # and an uncapped leg is unchanged
     assert xb.placed_stop_frac(100.0, 1.0) == pytest.approx(0.08)
+
+
+def test_unknown_regime_falls_back_to_the_STRICTEST_heat_budget():
+    """cy384 REGRESSION. The desk's context carries `regime_state.regime` ("risk_off"), NOT
+    `quadrant`, so the book CLI's `or "low_vol_range"` fallback silently assumed max_heat=0.04 and
+    sized 10 legs/side. The gate enforced 0.020 and VETOED two legs for no heat headroom, leaving
+    L9/S10.
+
+    Guessing optimistically about a SAFETY limit is the wrong direction: too few legs still
+    executes, too many gets vetoed and comes out lopsided. With the quadrant unknown, assume the
+    tightest budget any quadrant could impose — DERIVED from policy, never hardcoded."""
+    from futures_fund.models import PortfolioHealth, RegimeState
+    from futures_fund.policy import _BASE_CAPS, caps_for
+    health = PortfolioHealth(equity=10_000.0, peak_equity=10_770.0, drawdown_from_peak=0.0716)
+    assert health.tier == "caution"
+    strictest = min(caps_for(RegimeState(quadrant=q, trend="up", vol="low"), health).max_heat
+                    for q in _BASE_CAPS)
+    assert xb.fallback_max_heat(health) == pytest.approx(strictest)
+    # and it must be no larger than what ANY quadrant allows
+    for q in _BASE_CAPS:
+        assert xb.fallback_max_heat(health) <= caps_for(
+            RegimeState(quadrant=q, trend="up", vol="low"), health).max_heat + 1e-12
+
+
+def test_the_fallback_would_have_prevented_the_cy384_vetoes():
+    """At cy384 the gate's cap was 0.020. The optimistic fallback sized 10/side (needs 0.040);
+    the strict fallback sizes 5/side, which fits."""
+    from futures_fund.models import PortfolioHealth
+    health = PortfolioHealth(equity=10_000.0, peak_equity=10_770.0, drawdown_from_peak=0.0716)
+    n = xb.fit_n_per_side(20, priced=98, max_heat=xb.fallback_max_heat(health))
+    assert n == 5, f"expected the strict budget to size 5/side, got {n}"
