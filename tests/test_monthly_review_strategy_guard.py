@@ -75,5 +75,11 @@ def test_the_live_review_actually_suppresses_its_stop_recommendation():
     sm = rep["stop_multiple"]
     assert sm["recommend"] is None, f"a stale atr_mult recommendation survived: {sm}"
     assert "suppressed_because" in sm
-    assert sm["measured_for_blended"]["recommend"] is not None, (
-        "the underlying measurement must be preserved for the record, not deleted")
+    # The measurement must be PRESERVED for the record, not deleted. Assert on its substance, not
+    # on whether it happens to recommend anything this month: a month where no candidate improved
+    # consistently yields recommend=None legitimately, and pinning that made this test fail on live
+    # data while the gate was working perfectly.
+    measured = sm["measured_for_blended"]
+    assert measured["candidates"] == sm["candidates"], (
+        "the underlying measurement must be preserved intact for the record")
+    assert measured["reason"], "the measurement must keep its own reasoning"

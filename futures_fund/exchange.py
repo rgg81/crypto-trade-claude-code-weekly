@@ -122,6 +122,11 @@ class FuturesExchange:
         # keyless: leverage tiers (an authenticated endpoint) are unavailable, so symbol_spec
         # falls back to a conservative default bracket. True for paper; False for live.
         self.keyless = keyless
+        # One-shot funding table for this process (see _warm_funding_cache). None = not yet
+        # attempted; a dict (even empty) = attempted, never re-attempted. Each CLI step is its own
+        # process, so this snapshot cannot go stale across cycles.
+        self._funding_cache: dict | None = None
+        self._funding_intervals: dict | None = None
 
     @classmethod
     def from_settings(cls, settings: Settings) -> FuturesExchange:
@@ -170,9 +175,46 @@ class FuturesExchange:
             return parse_ohlcv(klines_to_ccxt_rows(raw))
         return parse_ohlcv(self.client.fetch_ohlcv(symbol, timeframe, None, limit))
 
+    def _warm_funding_cache(self) -> None:
+        """Fetch the venue's whole funding table ONCE per process.
+
+        WHY THIS EXISTS. `mark_prices` batched the GATE's ~20-position pricing burst; preflight
+        still priced the whole ~100-name universe one symbol at a time, because protected
+        `cycle.fetch_context` does `{s: exchange.funding(s) for s in settings.symbols}` and each
+        call cost TWO unproxied requests. ~200 sequential requests into the 8-hourly settlement
+        window timed out at cy409 (08:00Z) and cy411 (16:00Z) while cy410 (12:00Z, not a
+        settlement hour) went through. `cycle` may not be edited, so the batching hides here and
+        the protected caller gets it unchanged.
+
+        BEST EFFORT BY DESIGN. A failed batch is recorded and never retried — one bad batch must
+        not become one bad batch per leg — and `funding()` simply falls back to the old per-symbol
+        path, which is slower but correct.
+        """
+        if self._funding_cache is not None:
+            return
+        self._funding_cache, self._funding_intervals = {}, {}
+        rates = getattr(self.client, "fetch_funding_rates", None)
+        if not callable(rates):
+            return
+        try:
+            self._funding_cache = with_retry(rates) or {}
+        except Exception:
+            return  # degrade to per-symbol; the cache stays empty and is not re-attempted
+        intervals = getattr(self.client, "fetch_funding_intervals", None)
+        if callable(intervals):
+            try:
+                self._funding_intervals = intervals() or {}
+            except Exception:
+                self._funding_intervals = {}  # every symbol falls back to the venue default 8h
+
     def funding(self, symbol: str) -> FundingInfo:
-        # UNPROXIED and called once per symbol — the burst that cost cy368/cy370. A transient
-        # timeout here is retried once; a BAN is never retried (see is_retryable).
+        # Served from the one-shot universe batch when the venue has it; otherwise UNPROXIED and
+        # once per symbol — the burst that cost cy368/cy370/cy409/cy411. A transient timeout here
+        # is retried once; a BAN is never retried (see is_retryable).
+        self._warm_funding_cache()
+        fr = (self._funding_cache or {}).get(symbol)
+        if fr:
+            return parse_funding(fr, (self._funding_intervals or {}).get(symbol))
         fr = with_retry(lambda: self.client.fetch_funding_rate(symbol))
         try:
             interval = self.client.fetch_funding_interval(symbol)
