@@ -131,7 +131,12 @@ class FuturesExchange:
     @classmethod
     def from_settings(cls, settings: Settings) -> FuturesExchange:
         ex = build_ccxt(settings)
-        ex.load_markets()
+        # `/fapi/v1/exchangeInfo` — the largest public payload on the venue and, until cy413, the
+        # ONE network call here with no retry. Both CLI entry points build the exchange this way,
+        # so a single flaky exchangeInfo took out preflight (cy413) or the gate (cy412, cy413) and
+        # cost the whole tick. with_retry keeps the rule that matters: transient faults get one
+        # more attempt, a rate-limit BAN gets none.
+        with_retry(ex.load_markets)
         return cls(ex, keyless=not settings.live,
                    klines_proxy_url=settings.exchange.klines_proxy_url)
 
