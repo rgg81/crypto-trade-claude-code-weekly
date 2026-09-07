@@ -17,7 +17,7 @@ import re
 import subprocess
 import sys
 import time
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 
 from futures_fund.config import load_settings
 
@@ -53,6 +53,31 @@ def _record_ban(state_dir, banned_until_ms: int) -> None:
                    "consecutive": _consecutive_bans(state_dir) + 1}, open(p, "w"))
     except Exception:  # noqa: BLE001 — telemetry only; never break the driver
         pass
+
+
+def save_outage(state_dir, cycle: int, stage: str, stderr: str | None) -> str | None:
+    """Persist the FULL stderr of a stage that produced no output, for the next post-mortem.
+
+    The console keeps only a ~200-char tail, which is the bottom of a Python traceback — the socket
+    frames every timeout shares, never the ccxt/urllib frame naming the endpoint that stalled. That
+    is why the funding-burst diagnosis and then the load_markets one were each only partly right:
+    cy415 still timed out in preflight after the retry shipped. This makes the NEXT outage
+    self-diagnosing instead of another guess from the same 200 characters.
+
+    Strictly best-effort: forensics must never turn a safely-held book into a crash, so every
+    failure here is swallowed and the hold path continues.
+    """
+    try:
+        safe = "".join(c for c in str(stage) if c.isalnum() or c in "._-")[:40] or "unknown"
+        cdir = os.path.join(state_dir, "cycle", str(int(cycle)))
+        os.makedirs(cdir, exist_ok=True)
+        path = os.path.join(cdir, "outage.txt")
+        stamp = datetime.now(UTC).isoformat()
+        with open(path, "a") as fh:
+            fh.write(f"\n===== {stamp} | stage={safe} =====\n{(stderr or '').strip()}\n")
+        return path
+    except Exception:  # noqa: BLE001 - a hold must never become a crash
+        return None
 
 
 def _capture_ban(state_dir, *texts) -> int | None:
@@ -275,6 +300,10 @@ def _gate_exposure(cycle: int):
         # the gate fetches prices mid-execute (cy297 died here on a 429) — a 418 surfacing now
         # must still record its deadline, or the next fire re-extends it
         _capture_ban(os.path.join(ROOT, "state"), r.stderr, r.stdout)
+        # The gate is the one stage that can die MID-EXECUTE, so its full output matters most:
+        # the console tail shows the socket frames, never which call stalled. cy412 and cy413 both
+        # died here and left only that tail.
+        save_outage(os.path.join(ROOT, "state"), cycle, "gate", (r.stderr or "") + "\n" + txt)
         print("GATE raw output:\n", txt[-1500:], r.stderr[-500:])
         return None
 
@@ -757,6 +786,7 @@ def main() -> int:
     pf = run(["scripts/preflight.py", "--cycle", str(cycle), "--symbols", ",".join(symbols)])
     if not os.path.exists(os.path.join(cdir, "context.json")):
         _bu = _capture_ban(_state, pf.stderr, pf.stdout)
+        save_outage(_state, cycle, "preflight", pf.stderr)
         longs, shorts = _book()
         _bnote = f" (ban until {_bu}, holding next fires until it lapses)" if _bu else ""
         print(f"HOLD-ON-DATA-OUTAGE cycle {cycle}: preflight produced no context (rate-limit/"
@@ -778,6 +808,7 @@ def main() -> int:
               "--n-per-side", str(_N_PER_SIDE), "--rebalance-every", str(_REBALANCE_EVERY)])
     if not os.path.exists(os.path.join(cdir, "proposals.json")):
         _capture_ban(_state, bb.stderr, bb.stdout)
+        save_outage(_state, cycle, "xsection_book_cli", bb.stderr)
         longs, shorts = _book()
         print(f"HOLD-ON-DATA-OUTAGE cycle {cycle}: xsection_book_cli produced no proposals — book "
               f"held, retry next tick. LONG {'/'.join(longs)} vs SHORT {'/'.join(shorts)} | "
