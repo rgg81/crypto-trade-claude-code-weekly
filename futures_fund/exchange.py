@@ -173,10 +173,16 @@ class FuturesExchange:
         already turns a raised fetch into a safely-held book.
         """
         if self.klines_proxy_url:
-            raw = _proxy_get_klines(
+            # RETRIED — the last un-retried call, and protected `cycle.fetch_context` makes it once
+            # per symbol over a ~100-name universe, so one stalled localhost GET past the 30s
+            # timeout lost the whole tick (cy417, named by the outage forensics). Safe to retry in a
+            # way a venue call would not be: an idempotent GET to a LOCAL coalescing proxy costs one
+            # loopback round-trip and cannot contribute to an IP ban. `with_retry` still refuses
+            # anything carrying a ban marker, so a 418 relayed through the proxy passes straight up.
+            raw = with_retry(lambda: _proxy_get_klines(
                 f"{self.klines_proxy_url}/fapi/v1/klines",
                 params={"symbol": self._raw_id(symbol), "interval": timeframe, "limit": limit},
-            )
+            ))
             return parse_ohlcv(klines_to_ccxt_rows(raw))
         return parse_ohlcv(self.client.fetch_ohlcv(symbol, timeframe, None, limit))
 
