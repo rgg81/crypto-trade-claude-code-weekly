@@ -148,6 +148,76 @@ def fit_n_per_side(requested: int, *, priced: int, max_heat: float,
     return max(1, min(int(requested), by_heat, by_universe))
 
 
+def effective_ptr(health, dd: float, quadrant: str | None) -> float:
+    """The per-trade risk fraction the gate will ACTUALLY charge, breaker included.
+
+    `risk_gate` computes `risk_pct = caps.per_trade_risk_pct * breaker.risk_multiplier * rm`, so
+    the heat a leg consumes is that product — reading caps alone misses the drawdown step-down and
+    understates every leg by 2x.
+
+    The breaker is asked with the drawdown only. Its other brakes (daily/weekly/monthly) can only
+    LOWER the multiplier further, so this returns an UPPER bound on the real ptr — the safe
+    direction: over-estimating ptr scales the book down a little, under-estimating it walks back
+    into the cy414 veto.
+    """
+    from futures_fund.models import RegimeState
+    from futures_fund.policy import caps_for, circuit_breaker
+    if quadrant:
+        caps = caps_for(RegimeState(quadrant=quadrant, trend="up", vol="low"), health)
+        ptr = caps.per_trade_risk_pct
+    else:
+        from futures_fund.policy import _BASE_CAPS
+        ptr = max(caps_for(RegimeState(quadrant=q, trend="up", vol="low"), health)
+                  .per_trade_risk_pct for q in _BASE_CAPS)
+    return ptr * circuit_breaker(0.0, 0.0, 0.0, dd).risk_multiplier
+
+
+def fit_heat(rm: dict[str, float], *, ptr: float, max_heat: float,
+             dust_frac: float = DUST_FRAC) -> dict[str, float]:
+    """Scale the risk_mult vector so the WHOLE book fits the gate's heat cap.
+
+    THE ARITHMETIC. The gate sizes by risk — qty = equity*ptr*rm / |entry-stop| — and charges
+    `position_risk` = qty*|entry-stop| / equity. The stop distance cancels, so
+
+        per-leg heat == ptr * rm        book heat == ptr * sum(rm)
+
+    `safe_n_per_side` clamps the leg COUNT off the dust floor, which is a lower bound on how SMALL
+    a leg may be; it never checked the rm VECTOR against the upper bound. Whether a rebalance fit
+    was therefore luck of the z-score distribution. At cy414 it did not: 10 legs came to 0.021
+    against a 0.020 cap, the gate vetoed the last long, and the neutrality guard then trimmed the
+    short sleeve by 0.106 to re-balance — the desk lost a leg AND shrank the other side to match.
+
+    Scaling keeps every leg and the sleeve symmetry, and only ever SHRINKS risk, which is all a
+    non-protected pre-sizer may do. The gate's cap is untouched and still has the last word.
+
+    THE FLOOR BINDS TOO. consolidate() deletes any leg under `dust_frac` of equity SILENTLY, so a
+    scale that fits the ceiling by breaching the floor trades a loud veto for a quiet dust drop —
+    strictly worse. Legs are never scaled below the floor; if cap and floor cannot both hold, the
+    book is left at the floor and the gate's visible veto stands.
+    """
+    if not rm or ptr <= 0:
+        return dict(rm)
+    total = sum(rm.values())
+    if total <= 0 or ptr * total <= max_heat:
+        return dict(rm)
+    floor_rm = dust_frac / ptr          # smallest rm that survives consolidate()
+    scale = max_heat / (ptr * total)
+    return {s: min(1.0, max(floor_rm, v * scale)) for s, v in rm.items()}
+
+
+def book_risk_mults(weights: dict[str, float], stop_frac: dict[str, float], *,
+                    ptr: float | None, max_heat: float | None) -> dict[str, float]:
+    """The book's risk_mults, scaled to fit the gate's heat cap when the caps are known.
+
+    Composed so the shipped path cannot drift from the tested one: `risk_mults` alone is what
+    walked into the cy414 veto.
+    """
+    rm = risk_mults(weights, stop_frac)
+    if ptr is None or max_heat is None:
+        return rm
+    return fit_heat(rm, ptr=ptr, max_heat=max_heat)
+
+
 def _raw(sym: str) -> str:
     return sym.replace("/", "").replace(":USDT", "")
 
@@ -276,14 +346,17 @@ def main() -> None:
             else:
                 _heat = fallback_max_heat(health)
                 _src = "quadrant UNKNOWN -> strictest budget"
+            _ptr = effective_ptr(health, dd, quad)
             n_side = fit_n_per_side(args.n_per_side, priced=len(series), max_heat=_heat)
             heat_note = (f"max_heat {_heat:.4f} @ {health.tier} ({_src}), priced {len(series)} -> "
                          f"{n_side} legs/side (asked {args.n_per_side})")
         except Exception as exc:  # noqa: BLE001 - never let a caps read stop the book
             n_side = max(MIN_N_PER_SIDE, min(args.n_per_side, len(series) // 2))
+            _heat = _ptr = None
             heat_note = f"caps read failed ({type(exc).__name__}) - universe-fitted {n_side}/side"
     else:
         n_side = max(MIN_N_PER_SIDE, min(args.n_per_side, len(series) // 2))
+        _heat = _ptr = None
         heat_note = f"no context - universe-fitted {n_side}/side"
 
     weights = cross_sectional_weights(series, n_per_side=n_side,
@@ -295,7 +368,7 @@ def main() -> None:
 
     if weights and rebalancing:
         stop_frac = {s: placed_stop_frac(last[s], atrs[s]) for s in weights}
-        rm = risk_mults(weights, stop_frac)
+        rm = book_risk_mults(weights, stop_frac, ptr=_ptr, max_heat=_heat)
         # Held legs booked under an older, TIGHTER stop policy still carry the exposure that policy
         # change removed (cy369: a legacy 2xATR leg stopped out and forced a neutrality trim). Close
         # and reopen them at the current stop; the whole migration costs ~2 fills per stale leg.
