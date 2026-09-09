@@ -124,6 +124,57 @@ def fallback_max_heat(health) -> float:
                for q in _BASE_CAPS)
 
 
+def bellwether_quadrant(series: dict[str, list[float]], symbols: list[str]) -> str | None:
+    """The regime quadrant the GATE will classify, derived exactly as the gate derives it.
+
+        futures_fund/cycle.py:150
+            caps = caps_for(simple_regime(ctx.frames[ctx.settings.symbols[0]]), health)
+
+    `symbols[0]` is the scout universe's first entry (BTC by convention) and `working_universe`
+    only ever APPENDS held symbols, so the first element is stable between preflight and the gate.
+    This calls `simple_regime` itself rather than re-implementing it — a copy would drift away from
+    the gate silently, which is exactly the failure being fixed. `simple_regime` reads only
+    `close`, so the CLI's close series is sufficient.
+
+    None when it cannot be determined, which the caller must treat as WORST case.
+    """
+    if not symbols or not series:
+        return None
+    first = symbols[0]
+    closes = series.get(first)
+    if not closes or len(closes) < 30:
+        return None
+    try:
+        import pandas as pd
+
+        from futures_fund.baseline import simple_regime
+        return simple_regime(pd.DataFrame({"close": list(closes)})).quadrant
+    except Exception:  # noqa: BLE001 - an unclassifiable tape must degrade, never stop the book
+        return None
+
+
+def gate_max_heat(health, series: dict[str, list[float]],
+                  symbols: list[str]) -> tuple[float, str]:
+    """The heat budget the gate will ACTUALLY enforce, plus a note naming where it came from.
+
+    The book used to assume the worst case across all quadrants because the desk's context carries
+    `regime_state.regime` ("risk_off"), not a quadrant. That sandbagged it by 2x — at cy424 the
+    gate was enforcing 0.080 (low_vol_range @ healthy) while the book sized to 0.040, halving both
+    gross AND the leg count that breadth depends on.
+
+    Nothing is weakened: policy's table is untouched and still has the last word. The book simply
+    stops guessing low. FAIL-SAFE: an unidentifiable bellwether keeps the pessimistic budget,
+    because over-asking is the direction that costs legs (cy384 vetoes, cy360 dust drops).
+    """
+    quad = bellwether_quadrant(series, symbols)
+    if quad is None:
+        return fallback_max_heat(health), "quadrant UNKNOWN -> strictest budget"
+    from futures_fund.models import RegimeState
+    from futures_fund.policy import caps_for
+    heat = caps_for(RegimeState(quadrant=quad, trend_direction="neutral"), health).max_heat
+    return heat, f"quadrant {quad} (as the gate classifies it)"
+
+
 def rm_for(sym: str, rm: dict[str, float]) -> float:
     """risk_mult for a leg, defaulting SMALL.
 
@@ -342,10 +393,14 @@ def main() -> None:
             if quad:
                 _heat = caps_for(RegimeState(quadrant=quad, trend="up", vol="low"),
                                  health).max_heat
-                _src = f"quadrant {quad}"
+                _src = f"quadrant {quad} (from context)"
             else:
-                _heat = fallback_max_heat(health)
-                _src = "quadrant UNKNOWN -> strictest budget"
+                # The context carries `regime_state.regime`, never a quadrant — but the gate does
+                # not read that field either. It classifies the BELLWETHER itself
+                # (cycle.py:150), so derive the same quadrant the same way instead of sandbagging
+                # to the worst case. Falls back to the strict budget when unidentifiable.
+                _heat, _src = gate_max_heat(health, series, symbols)
+                quad = bellwether_quadrant(series, symbols)
             _ptr = effective_ptr(health, dd, quad)
             n_side = fit_n_per_side(args.n_per_side, priced=len(series), max_heat=_heat)
             heat_note = (f"max_heat {_heat:.4f} @ {health.tier} ({_src}), priced {len(series)} -> "
