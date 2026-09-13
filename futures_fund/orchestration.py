@@ -130,6 +130,52 @@ def _holding_card(pos, brief: dict, now: datetime, timeframe: str, decision: dic
     return card
 
 
+def audit_with_gap_backfill(ctx, positions, account, memory_dir, now: datetime, report: dict,
+                            state_dir, *, agent_key: str = _AGENT_KEY):
+    """The strategic exit audit, covering the part of every candle no tick ever looked at.
+
+    The PROTECTED `audit_and_reflect` checks `.iloc[-1]` — the candle FORMING when the tick runs —
+    so each 4h audit saw ~25 minutes of a candle and never the other ~3h35m. That is not a downtime
+    edge case; it is every candle. UAIUSDT (2026-09-12) fell through its stop in the 12:00Z candle
+    after that candle's 12:25Z audit and was booked ~20h late; BEATUSDT wicked through its stop in a
+    tail no audit saw, recovered, and stayed open — -$2.40 on paper where a resting stop realised
+    -$14.27. The error only ever flatters the desk.
+
+    So before the live audit, replay every COMPLETED candle from the last served one, INCLUSIVE:
+    the gate stamps the served candle as the one that was forming, so it was only partly audited.
+    `fast_loop._replay_missed_bars` does the replay and reuses the protected functions verbatim;
+    positions opened, or stops trailed, inside a candle are not tested against it. In steady state
+    each candle is fully checked exactly once after it closes.
+
+    Fail-safe: with no served candle there is no bound on what to replay, so the legacy
+    latest-bar-only audit runs alone; a replay error is alerted and never skips the live audit.
+    """
+    from futures_fund import fast_loop
+    from futures_fund.scheduling import floor_tf, last_served_candle, tf_to_minutes
+
+    tf = ctx.settings.timeframe
+    tfm = tf_to_minutes(tf)
+    served = last_served_candle(state_dir, now, tf_minutes=tfm, loop=None)
+    if served is not None:
+        try:
+            positions = fast_loop._replay_missed_bars(
+                ctx, positions, account, memory_dir, served, floor_tf(now, tfm), tf, report,
+                include_prev=True, agent_key=agent_key)
+        except Exception:  # noqa: BLE001 — the live latest-bar audit below is load-bearing
+            report.setdefault("alerts", []).append("gap-backfill skipped after internal error")
+    return audit_and_reflect(ctx, positions, account, memory_dir, now, report, agent_key=agent_key)
+
+
+def _audit_summary(report: dict) -> dict:
+    """The exit audit as published in context.json: counts PLUS every close and alert.
+
+    Counts alone hid what mattered once the audit started replaying unseen candles — a close booked
+    on an EARLIER candle (`bar_close`), or a replay that stopped part-way (`alerts`)."""
+    return {"closed": report["closed"], "carried": report["carried"],
+            "closes": [a for a in report.get("actions", []) if "close" in a],
+            "alerts": list(report.get("alerts", []))}
+
+
 def preflight_step(exchange, settings: Settings, state_dir, memory_dir,
                    now: datetime, cycle_no: int, http_client=None) -> dict:
     """Phase 0-2: load state, audit exits (BEFORE the halt check so a halt still closes
@@ -154,8 +200,8 @@ def preflight_step(exchange, settings: Settings, state_dir, memory_dir,
     report = {"cycle": cycle_no, "halted": False, "opened": 0, "closed": 0,
               "carried": 0, "stuck_close": 0, "equity": account.balance, "actions": []}
     ctx = fetch_context(exchange, settings)
-    positions = audit_and_reflect(ctx, positions, account, memory_dir, now, report,
-                                  agent_key=_AGENT_KEY)
+    positions = audit_with_gap_backfill(ctx, positions, account, memory_dir, now, report,
+                                        state_dir, agent_key=_AGENT_KEY)
     save_account(state_dir, account)
     save_positions(state_dir, positions)
     # Soft dollar-neutral exposure read (market-neutral mandate): gross long $ vs short $ + net
@@ -177,7 +223,7 @@ def preflight_step(exchange, settings: Settings, state_dir, memory_dir,
         return {"cycle": cycle_no, "halted": True, "briefs": [], "equity": account.balance,
                 "open_positions": [{"symbol": p.symbol, "direction": p.direction}
                                    for p in positions],
-                "audit": {"closed": report["closed"], "carried": report["carried"]},
+                "audit": _audit_summary(report),
                 "market_context": market_context, "exposure": exposure,
                 "regime_state": _classify_regime_safe(state_dir, market_context, [], now, cycle_no),
                 "scorecard": _with_exposure_warning(
@@ -278,7 +324,7 @@ def preflight_step(exchange, settings: Settings, state_dir, memory_dir,
         "briefs": briefs,
         "open_positions": [{"symbol": p.symbol, "direction": p.direction, "qty": p.qty,
                             "entry": p.entry} for p in positions],
-        "audit": {"closed": report["closed"], "carried": report["carried"]},
+        "audit": _audit_summary(report),
         "market_context": market_context,
         "exposure": exposure,
         "regime_state": regime_state,
@@ -738,7 +784,7 @@ def gate_execute_step(exchange, settings: Settings, state_dir, memory_dir,
                                         _position_atr(ctx, p.symbol, now, settings.timeframe))
                 if w:
                     reduce_warnings.append(w)
-                survivor = survivor.model_copy(update={"stop": float(ns)})
+                survivor = survivor.model_copy(update={"stop": float(ns), "stop_ts": now})
                 trailed += 1
             new_positions.append(survivor)
             continue
@@ -750,7 +796,7 @@ def gate_execute_step(exchange, settings: Settings, state_dir, memory_dir,
                                         _position_atr(ctx, p.symbol, now, settings.timeframe))
                 if w:
                     reduce_warnings.append(w)
-                p = p.model_copy(update={"stop": ns})  # trail only; never loosen
+                p = p.model_copy(update={"stop": ns, "stop_ts": now})  # trail only; never loosen
                 trailed += 1
         new_positions.append(p)
     positions = new_positions

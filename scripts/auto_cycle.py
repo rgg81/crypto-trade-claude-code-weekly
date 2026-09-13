@@ -570,6 +570,31 @@ def exposure_from_positions(positions) -> dict:
             "n_long": nl, "n_short": ns}
 
 
+def exit_lines(context) -> str:
+    """`exits: UAI stop $-23.97 @09-12 16:00Z | LSK take_profit $+132.53` — what preflight closed.
+
+    cy443 closed two legs in preflight and the console said only `hold 37`; the closes, their PnL
+    and the fact that UAI had crossed its stop ~20h earlier all had to be dug out of the journal.
+    The strategic audit now replays candles no tick saw, so a close can land on an EARLIER candle —
+    `@` stamps when it really closed. Alerts (a replay that failed) print too. Reporting only: a
+    legacy or malformed context yields "" and never breaks the tick.
+    """
+    try:
+        audit = (context or {}).get("audit") or {}
+        parts = []
+        for a in audit.get("closes") or []:
+            s = (f"{str(a.get('close', '?')).removesuffix('USDT')} {a.get('reason', '?')} "
+                 f"${float(a.get('pnl') or 0.0):+.2f}")
+            if a.get("bar_close"):
+                s += f" @{datetime.fromisoformat(str(a['bar_close'])).astimezone(UTC):%m-%d %H:%MZ}"
+            parts.append(s)
+        lines = [f"exits: {' | '.join(parts)}"] if parts else []
+        lines += [f"  ALERT: {x}" for x in audit.get("alerts") or []]
+        return "\n".join(lines)
+    except Exception:  # noqa: BLE001 — reporting must never break the tick
+        return ""
+
+
 def neutrality_alarm(exposure) -> str:
     """A loud, explicit line when the book is off-neutral — or "" when it is fine.
 
@@ -794,6 +819,12 @@ def main() -> int:
               f"LONG {'/'.join(longs)} vs SHORT {'/'.join(shorts)} | "
               f"{_pnl_line()} | err: {pf.stderr.strip()[-200:]}")
         return _exit_code(longs, shorts)
+    try:
+        _exits = exit_lines(json.load(open(os.path.join(cdir, "context.json"))))
+    except Exception:  # noqa: BLE001 — reporting only
+        _exits = ""
+    if _exits:
+        print(_exits)
 
     # deterministic news-neutral overlay (regime engine flags risk_off independently; blended engine
     # excludes pumps deterministically) -> satisfies the gate funnel + reclassify without any LLM.

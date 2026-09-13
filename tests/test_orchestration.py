@@ -305,6 +305,36 @@ def test_reduce_with_new_stop_banks_and_trails_runner(tmp_path):
     assert len(pos) == 1 and pos[0].qty == 0.5 and pos[0].stop == 110.0  # runner trimmed + trailed
 
 
+# The strategic gap backfill re-checks the candle a tick served against each position's CURRENT
+# stop. A stop trailed inside that candle must not be tested against its pre-trail prices, so every
+# trail stamps WHEN the stop took effect (tests/test_strategic_gap_backfill.py).
+
+def test_hold_trail_stamps_when_the_stop_took_effect(tmp_path):
+    state_dir, memory_dir, ex = _seed_holding(tmp_path)
+    now = dt.datetime(2026, 3, 1, tzinfo=UTC)
+    gate_execute_step(ex, _settings(), state_dir, memory_dir, now=now, cycle_no=2, proposals=[],
+                      management=[{"symbol": "ETHUSDT", "action": "hold", "new_stop": 95.0}])
+    assert load_positions(state_dir)[0].stop_ts == now
+
+
+def test_reduce_trail_stamps_when_the_runners_stop_took_effect(tmp_path):
+    state_dir, memory_dir, ex = _seed_holding(tmp_path)
+    now = dt.datetime(2026, 3, 1, tzinfo=UTC)
+    gate_execute_step(ex, _settings(), state_dir, memory_dir, now=now, cycle_no=2, proposals=[],
+                      management=[{"symbol": "ETHUSDT", "action": "reduce",
+                                   "reduce_fraction": 0.5, "new_stop": 110.0}])
+    assert load_positions(state_dir)[0].stop_ts == now
+
+
+def test_a_rejected_trail_leaves_the_stop_timestamp_alone(tmp_path):
+    """A loosening stop is refused, so the original stop — and its timing — still stand."""
+    state_dir, memory_dir, ex = _seed_holding(tmp_path)
+    gate_execute_step(ex, _settings(), state_dir, memory_dir,
+                      now=dt.datetime(2026, 3, 1, tzinfo=UTC), cycle_no=2, proposals=[],
+                      management=[{"symbol": "ETHUSDT", "action": "hold", "new_stop": 80.0}])
+    assert load_positions(state_dir)[0].stop_ts is None
+
+
 def test_reduce_rejects_loosening_new_stop_but_still_banks(tmp_path):
     state_dir, memory_dir, ex = _seed_holding(tmp_path)  # long, stop 90, mark ~147
     report = gate_execute_step(  # new_stop 80 is BELOW current 90 (looser for a long) -> rejected

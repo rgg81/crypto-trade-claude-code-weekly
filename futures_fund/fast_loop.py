@@ -99,21 +99,33 @@ def _sliced_ctx(ctx: CycleContext, bar_open) -> CycleContext | None:
     return CycleContext(ctx.settings, frames, fundings, specs, raw_to_unified, specs_by_raw, prices)
 
 
+def _at_or_before(ts, bar_open) -> bool:
+    """`ts <= bar_open`, coercing either side from naive to UTC."""
+    bo = bar_open.to_pydatetime() if hasattr(bar_open, "to_pydatetime") else bar_open
+    if getattr(ts, "tzinfo", None) is None:
+        ts = ts.replace(tzinfo=UTC)
+    if getattr(bo, "tzinfo", None) is None:
+        bo = bo.replace(tzinfo=UTC)
+    return ts <= bo
+
+
 def _opened_le(position, bar_open) -> bool:
     """True if `position` already existed at `bar_open` (opened at/before the bar). Coerces a naive
     opened_ts to UTC; an absent opened_ts -> True (pre-existing; don't suppress a check)."""
     ot = getattr(position, "opened_ts", None)
-    if ot is None:
-        return True
-    bo = bar_open.to_pydatetime() if hasattr(bar_open, "to_pydatetime") else bar_open
-    if getattr(ot, "tzinfo", None) is None:
-        ot = ot.replace(tzinfo=UTC)
-    if getattr(bo, "tzinfo", None) is None:
-        bo = bo.replace(tzinfo=UTC)
-    return ot <= bo
+    return True if ot is None else _at_or_before(ot, bar_open)
 
 
-def _replay_missed_bars(ctx, positions, account, memory_dir, prev_open, current_open, tf, report):
+def _stop_set_le(position, bar_open) -> bool:
+    """True if `position`'s CURRENT stop was already in force at `bar_open`. A stop trailed inside a
+    bar must not be tested against that bar's pre-trail prices. An absent stop_ts means the stop has
+    stood since the open (never trailed), which `_opened_le` already covers."""
+    st = getattr(position, "stop_ts", None)
+    return True if st is None else _at_or_before(st, bar_open)
+
+
+def _replay_missed_bars(ctx, positions, account, memory_dir, prev_open, current_open, tf, report,
+                        *, include_prev: bool = False, agent_key: str | None = None):
     """Downtime-gap backfill: replay every COMPLETED bar whose open lies strictly between
     `prev_open` (the last actually-swept candle) and `current_open` (the forming bar), oldest-first,
     so a stop/TP/liq that triggered while the desk was DOWN still closes — at that bar's price, with
@@ -121,12 +133,20 @@ def _replay_missed_bars(ctx, positions, account, memory_dir, prev_open, current_
     verbatim via frame slicing. Closing on the FIRST hitting bar is pessimistic (correct for a paper
     fill). No-op (empty gap set) on normal cadence, so the live path is unchanged.
 
-    Two safety gates: (1) a bar is only exit-checked against positions that already EXISTED at its
-    open (`_opened_le`) — the fast anchor does NOT advance on a strategic open, so the gap window
-    can contain bars predating a just-opened position, and detect_exit has no opened_ts guard;
-    without this a pre-entry stop/liq/TP would spuriously close a position at a price never traded.
-    (2) If the outage predates the fetched OHLCV window, early bars can't be replayed -> alert
-    instead of silently dropping them."""
+    `include_prev` also replays the `prev_open` bar itself. The fast loop leaves it out, but the 4h
+    strategic loop needs it: its anchor is the candle that was FORMING when the tick ran, so only
+    ~25 minutes of it were ever audited (see orchestration.audit_with_gap_backfill).
+
+    Three safety gates: (1) a bar is only exit-checked against positions that already EXISTED at
+    its open (`_opened_le`) — the fast anchor does NOT advance on a strategic open, so the gap
+    window can contain bars predating a just-opened position, and detect_exit has no opened_ts
+    guard; without this a pre-entry stop/liq/TP would spuriously close a position at a price never
+    traded.
+    The same holds for a stop TRAILED inside a bar (`_stop_set_le`). (2) If the outage predates the
+    fetched OHLCV window, early bars can't be replayed -> alert instead of silently dropping them.
+    (3) A failure part-way through returns the positions as they stand AFTER the closes already
+    made. Raising instead would hand the caller the pre-replay list, and the live audit would close
+    the same leg again and credit its PnL twice."""
     if not positions:
         return positions
     step = timedelta(minutes=tf_to_minutes(tf))
@@ -142,27 +162,36 @@ def _replay_missed_bars(ctx, positions, account, memory_dir, prev_open, current_
             f"gap exceeds fetch window; early-outage bars unswept for {','.join(partial)}")
     gap_ts = sorted({
         ts for df in ctx.frames.values() for ts in df["timestamp"]
-        if prev_open < ts < current_open
+        if (prev_open <= ts if include_prev else prev_open < ts) and ts < current_open
     })
+    kw = {"agent_key": agent_key} if agent_key else {}
     for bar_open in gap_ts:
         if not positions:
             break
-        eligible = [p for p in positions if _opened_le(p, bar_open)]
-        deferred = [p for p in positions if not _opened_le(p, bar_open)]
-        if not eligible:
-            continue
-        ctx_i = _sliced_ctx(ctx, bar_open)
-        if ctx_i is None:
-            continue
-        bar_close = bar_open.to_pydatetime().astimezone(UTC) + step
-        # A throwaway sub-report: audit_and_reflect bumps carried for any eligible position whose
-        # symbol _sliced_ctx dropped at this bar (sym is None branch). That per-bar carried count is
-        # meaningless here (run_exit_sweep sets the true carried after the live sweep), so only the
-        # real closes/actions flow back — no polluted carried, no load-bearing coupling.
-        sub = {"closed": 0, "carried": 0, "actions": []}
-        survivors = audit_and_reflect(ctx_i, eligible, account, memory_dir, bar_close, sub)
+        try:
+            live = [_opened_le(p, bar_open) and _stop_set_le(p, bar_open) for p in positions]
+            eligible = [p for p, ok in zip(positions, live, strict=True) if ok]
+            deferred = [p for p, ok in zip(positions, live, strict=True) if not ok]
+            if not eligible:
+                continue
+            ctx_i = _sliced_ctx(ctx, bar_open)
+            if ctx_i is None:
+                continue
+            bar_close = bar_open.to_pydatetime().astimezone(UTC) + step
+            # A throwaway sub-report: audit_and_reflect bumps carried for any eligible position
+            # whose symbol _sliced_ctx dropped at this bar (sym is None branch). That per-bar
+            # carried count is meaningless here (run_exit_sweep sets the true carried after the
+            # live sweep), so only the real closes/actions flow back — no polluted carried, no
+            # load-bearing coupling.
+            sub = {"closed": 0, "carried": 0, "actions": []}
+            survivors = audit_and_reflect(ctx_i, eligible, account, memory_dir, bar_close, sub,
+                                          **kw)
+        except Exception:  # noqa: BLE001 — keep the closes already made; see safety gate (3)
+            report.setdefault("alerts", []).append(
+                f"gap-backfill stopped at the {bar_open} bar after an internal error")
+            break
         report["closed"] += sub["closed"]
-        report["actions"].extend(sub["actions"])
+        report["actions"].extend({**a, "bar_close": bar_close.isoformat()} for a in sub["actions"])
         positions = deferred + survivors
     return positions
 
