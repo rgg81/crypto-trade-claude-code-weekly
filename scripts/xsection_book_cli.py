@@ -130,17 +130,21 @@ def bellwether_quadrant(series: dict[str, list[float]], symbols: list[str]) -> s
         futures_fund/cycle.py:150
             caps = caps_for(simple_regime(ctx.frames[ctx.settings.symbols[0]]), health)
 
-    `symbols[0]` is the scout universe's first entry (BTC by convention) and `working_universe`
-    only ever APPENDS held symbols, so the first element is stable between preflight and the gate.
-    This calls `simple_regime` itself rather than re-implementing it — a copy would drift away from
-    the gate silently, which is exactly the failure being fixed. `simple_regime` reads only
-    `close`, so the CLI's close series is sufficient.
+    The gate's `symbols[0]` comes from `futures_fund.bellwether.bellwether_first` — BTC when
+    present, else the scout's leader — and so does this. The earlier version ASSUMED the scout's
+    first entry was BTC; it was the 24h-volume leader (ETH at cy444), while the gate sorted
+    alphabetically and read 1000BONK, so the book sized for high_vol_range while the gate enforced
+    high_vol_trend. One shared ordering is what makes the two agree; `working_universe` only ever
+    APPENDS held symbols, so it cannot displace the bellwether. This calls `simple_regime` itself
+    rather than re-implementing it — a copy would drift away from the gate silently.
+    `simple_regime` reads only `close`, so the CLI's close series is sufficient.
 
     None when it cannot be determined, which the caller must treat as WORST case.
     """
+    from futures_fund.bellwether import bellwether_first
     if not symbols or not series:
         return None
-    first = symbols[0]
+    first = bellwether_first(symbols)[0]
     closes = series.get(first)
     if not closes or len(closes) < 30:
         return None

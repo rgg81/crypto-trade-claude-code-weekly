@@ -9,6 +9,7 @@ import json
 import sys
 from datetime import UTC, datetime
 
+from futures_fund.bellwether import bellwether_first
 from futures_fund.config import load_settings
 from futures_fund.cycle_io import load_output, save_output
 from futures_fund.exchange import FuturesExchange
@@ -18,6 +19,16 @@ from futures_fund.orchestration import (
     management_review,
     reclassify_skipped,
 )
+
+
+def context_universe(context: dict) -> list[str]:
+    """The gate universe folded from a cycle's context briefs, bellwether FIRST.
+
+    ORDER IS LOAD-BEARING: the protected gate takes the whole desk's regime caps from
+    `symbols[0]`. This used to be `sorted(set(...))`, which made that a `1000...` meme coin. See
+    futures_fund/bellwether.py."""
+    return bellwether_first([b.get("symbol") for b in (context.get("briefs") or [])
+                             if b.get("symbol") and not b.get("regime_panel_only")])
 
 
 def main() -> None:
@@ -32,7 +43,7 @@ def main() -> None:
     settings = load_settings()
     # explicit --symbols (even empty) is the Watcher's universe for this cycle; never the default
     if args.symbols is not None:
-        syms = [s.strip() for s in args.symbols.split(",") if s.strip()]
+        syms = bellwether_first([s.strip() for s in args.symbols.split(",") if s.strip()])
         settings = settings.model_copy(update={"symbols": syms})
     else:
         # ROBUSTNESS: when --symbols is omitted, fold in the universe the desks actually analyzed —
@@ -41,12 +52,10 @@ def main() -> None:
         # (their specs/funding were never loaded) — silently flattening the whole book. Fail-safe:
         # on any error we leave settings unchanged (prior behavior).
         try:
-            _ctx0 = load_output("state", args.cycle, "context")
-            _uni = [b.get("symbol") for b in (_ctx0.get("briefs") or [])
-                    if b.get("symbol") and not b.get("regime_panel_only")]
+            _uni = context_universe(load_output("state", args.cycle, "context"))
             if _uni:
-                settings = settings.model_copy(update={"symbols": sorted(set(_uni))})
-                print(f"INFO: --symbols omitted; folded {len(set(_uni))} symbols from "
+                settings = settings.model_copy(update={"symbols": _uni})
+                print(f"INFO: --symbols omitted; folded {len(_uni)} symbols from "
                       f"cycle {args.cycle} context briefs into the gate universe.", file=sys.stderr)
         except FileNotFoundError:
             print("WARNING: --symbols omitted and context.json missing — gate runs on config "

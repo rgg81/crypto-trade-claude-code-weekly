@@ -64,8 +64,9 @@ def test_it_classifies_the_same_way_the_GATE_does():
     assert bellwether_quadrant({"BTCUSDT": closes}, ["BTCUSDT", "ETHUSDT"]) == expected
 
 
-def test_the_bellwether_is_the_FIRST_universe_symbol_not_a_hardcoded_BTC():
-    """The gate uses settings.symbols[0]; if the scout ever reorders, this must follow it."""
+def test_without_btc_the_bellwether_follows_the_universe_order():
+    """With no BTC in the universe the gate's settings.symbols[0] is the scout's leader, so a
+    reorder must move the classification with it (BTC-first: tests/test_gate_bellwether.py)."""
     trend, flat = _trending_closes(), _flat_closes()
 
     as_first = bellwether_quadrant({"AAA": trend, "BBB": flat}, ["AAA", "BBB"])
