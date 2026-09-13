@@ -16,9 +16,11 @@ import os
 import re
 import subprocess
 import sys
+import threading
 import time
 from datetime import UTC, datetime, timedelta
 
+from futures_fund import runlock
 from futures_fund.config import load_settings
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -718,6 +720,62 @@ def _check_monthly_review() -> bool:
     return True
 
 
+# HARD RULE 8 — ONE WRITER FOR THE WHOLE TICK. run_loops takes the lock only to decide "due" and
+# releases it when its process exits, and the gate stamps the candle served only AFTER executing,
+# so for the whole multi-minute tick the candle still reads due. Two overlapping runs (a manual
+# status run near a cron fire, or a tick outlasting the 30-min cadence) both executed.
+_TICK_BEAT_S = 60                  # heartbeat: well inside runlock's 30-min stale window
+_TICK_LEASE_MAX_S = 2 * 60 * 60    # ...but a hung tick must not wedge the desk forever
+
+
+def _beat(state_dir, started: datetime, now: datetime, *,
+          max_lease_s: float = _TICK_LEASE_MAX_S) -> bool:
+    """One heartbeat: refresh our lease, unless the tick has run past the cap. False = stop."""
+    if (now - started).total_seconds() >= max_lease_s:
+        return False
+    return runlock.refresh(state_dir, now)
+
+
+class _TickLock:
+    """The run lock held for one tick, with a daemon heartbeat keeping its lease fresh."""
+
+    def __init__(self, state_dir, started: datetime, beat_every_s: float):
+        self.state_dir = state_dir
+        self._stop = threading.Event()
+        self.thread = threading.Thread(target=self._run, args=(started, beat_every_s),
+                                       name="tick-lock-heartbeat", daemon=True)
+        self.thread.start()
+
+    def _run(self, started: datetime, every: float) -> None:
+        while not self._stop.wait(every):
+            if not _beat(self.state_dir, started, datetime.now(UTC)):
+                return
+
+    def release(self) -> None:
+        self._stop.set()
+        self.thread.join(timeout=5)
+        runlock.release_if_owned(self.state_dir)   # never delete a lock someone reclaimed
+
+
+def _hold_tick_lock(state_dir, *, beat_every_s: float = _TICK_BEAT_S) -> _TickLock | None:
+    """Acquire the run lock for this tick, or None if another live tick holds it."""
+    now = datetime.now(UTC)
+    ok, _ = runlock.try_acquire(state_dir, now, owner="auto_cycle")
+    return _TickLock(state_dir, now, beat_every_s) if ok else None
+
+
+def _still_due(state_dir, cycle) -> bool:
+    """Re-check, UNDER the lock, that the cycle run_loops announced is still the one due.
+
+    Between run_loops releasing the lock and this tick acquiring it, another tick may have served
+    the candle — or the wait may have crossed into the next candle, whose pipeline this tick has
+    not prepared. Either way the next fire handles it from scratch."""
+    from futures_fund import scheduling
+    mode, n, _ = scheduling.cycle_due(state_dir, datetime.now(UTC),
+                                      tf_minutes=scheduling.tf_to_minutes("4h"), loop=None)
+    return mode in ("FRESH", "RETRY") and n == cycle
+
+
 def main() -> int:
     _state = os.path.join(ROOT, "state")
     rl = run(["scripts/run_loops.py"])
@@ -744,179 +802,203 @@ def main() -> int:
         return _exit_code(longs, shorts)
 
     cdir = os.path.join(ROOT, "state", "cycle", str(cycle))
-    print(f"DUE cycle {cycle}: running deterministic blended tick")
-
-    # BAN GUARD (self-heal): if a prior fire recorded an ACTIVE -1003 IP ban, HOLD before touching
-    # the exchange — any fetch now would only re-extend the ban ~22min and it would never lapse
-    # (observed cy190: the ban ratcheted ahead of real time across rapid fires). Wait it out; the
-    # next fire landing after the deadline fetches cleanly. The 4h candle is still there to execute.
-    rem = _ban_remaining_ms(_state, cooldown_ms=_ban_cooldown_ms(_consecutive_bans(_state)))
-    if rem > 0:
-        raw = _ban_remaining_ms(_state)          # 0 once the ban itself has lapsed
-        why = (f"Binance -1003 ban still active for ~{raw // 60000}m — skipping scout to let it "
-               f"lapse (no fetch = no re-extend)"
-               if raw > 0 else
-               f"ban lapsed; holding a further ~{rem // 60000}m quiet period before fetching "
-               f"after {_consecutive_bans(_state)} consecutive bans "
-               f"(each retry that draws a 418 extends the next ban)")
+    tick_lock = _hold_tick_lock(_state)
+    if tick_lock is None:
         longs, shorts = _book()
-        book = f"LONG {'/'.join(longs)} vs SHORT {'/'.join(shorts)}"
-        print(f"HOLD-ON-DATA-OUTAGE cycle {cycle}: {why}, book held. {book} | {_pnl_line()}")
-        return _exit_code(longs, shorts)
-
-    # A DATA OUTAGE (Binance rate-limit 418/-1003, network) makes scout/preflight produce no file.
-    # That is transient, not a code bug: HOLD the book and retry next tick, never crash. The book
-    # is untouched — the gate has not run. The exit code reports the BOOK, not the outage: holding a
-    # balanced book exits 0 so the cron does not flag a transient fetch failure, but holding a NAKED
-    # one still exits _EXIT_FLAT. The violation does not stop being a violation because the tick
-    # that would have repaired it could not fetch prices — cy296 held an L3/S0 book through a ban
-    # and reported success.
-    # WIDE UNIVERSE. The desk is now a cross-sectional factor book: breadth IS the edge. Measured
-    # over 230 perps x 2190 4h bars, the same momentum signal returns Sharpe 1.19 with a 35%
-    # drawdown at 3 legs/side and Sharpe 3.24 with a 13.5% drawdown at 20/side. Twelve names cannot
-    # support 40 legs, so the scout now ranks the top 100 by 24h volume.
-    sc = run(["scripts/scout_cli.py", "--cycle", str(cycle), "--top", "100"])
-    upath = os.path.join(cdir, "universe.json")
-    if not os.path.exists(upath):
-        # record any -1003 ban deadline so the NEXT fire holds before fetching (self-heal)
-        _bu = _capture_ban(_state, sc.stderr, sc.stdout)
-        longs, shorts = _book()
-        book = f"LONG {'/'.join(longs)} vs SHORT {'/'.join(shorts)}"
-        _bnote = f" (ban until {_bu}, holding next fires until it lapses)" if _bu else ""
-        print(f"HOLD-ON-DATA-OUTAGE cycle {cycle}: scout produced no universe (Binance "
-              f"rate-limit/network){_bnote} — book held, retry next tick. {book} | "
-              f"{_pnl_line()} | err: {sc.stderr.strip()[-160:]}")
-        return _exit_code(longs, shorts)
-    _clear_ban(_state)          # scout fetched cleanly -> the IP is good, reset the backoff
-    uni = json.load(open(upath))
-    uni_syms = [s["symbol"] for s in uni.get("universe", uni.get("candidates", []))]
-    symbols = list(dict.fromkeys(uni_syms + _held_symbols()))  # union, order-preserving
-
-    # DATA BEFORE THE CYCLE (operator requirement, non-negotiable): warm every series through the
-    # local binance-proxy first, and refuse to trade a stale tape.
-    _tf = "4h"
-    _proxy = load_settings().exchange.klines_proxy_url
-    _warmed, _stale, _werr = _warm_klines(
-        [s.split("/")[0] + "USDT" for s in symbols], _tf, _proxy)
-    print(f"warm: {_warmed}/{len(symbols)} series via proxy {_proxy or '(none)'}"
-          + (f" | stale: {'/'.join(x.replace('USDT', '') for x in _stale)}" if _stale else "")
-          + (f" | err: {_werr}" if _werr else ""))
-    if _stale:
-        longs, shorts = _book()
-        print(f"HOLD-ON-STALE-DATA cycle {cycle}: {len(_stale)} of {len(symbols)} series are older "
-              f"than {_MAX_AGE_INTERVALS} x {_tf} — refusing to size a book on a stale tape. "
-              f"book held. LONG {'/'.join(longs)} vs SHORT {'/'.join(shorts)} | {_pnl_line()}")
-        return _exit_code(longs, shorts)
-
-    pf = run(["scripts/preflight.py", "--cycle", str(cycle), "--symbols", ",".join(symbols)])
-    if not os.path.exists(os.path.join(cdir, "context.json")):
-        _bu = _capture_ban(_state, pf.stderr, pf.stdout)
-        save_outage(_state, cycle, "preflight", pf.stderr)
-        longs, shorts = _book()
-        _bnote = f" (ban until {_bu}, holding next fires until it lapses)" if _bu else ""
-        print(f"HOLD-ON-DATA-OUTAGE cycle {cycle}: preflight produced no context (rate-limit/"
-              f"network){_bnote} — book held, retry next tick. "
-              f"LONG {'/'.join(longs)} vs SHORT {'/'.join(shorts)} | "
-              f"{_pnl_line()} | err: {pf.stderr.strip()[-200:]}")
-        return _exit_code(longs, shorts)
-    try:
-        _exits = exit_lines(json.load(open(os.path.join(cdir, "context.json"))))
-    except Exception:  # noqa: BLE001 — reporting only
-        _exits = ""
-    if _exits:
-        print(_exits)
-
-    # deterministic news-neutral overlay (regime engine flags risk_off independently; blended engine
-    # excludes pumps deterministically) -> satisfies the gate funnel + reclassify without any LLM.
-    raw = [s.split("/")[0] + "USDT" for s in symbols]
-    reps = [{"agent": "news", "symbol": s, "stance": "neutral", "confidence": 0.3,
-             "key_points": ["Deterministic auto-cycle: no LLM news read; regime engine sets risk, "
-                            "blended engine excludes pumps."],
-             "signals": {"catalyst_count": 0, "risk_off_flag": 0}} for s in raw]
-    json.dump(reps, open(os.path.join(cdir, "analyst_reports.json"), "w"), indent=2)
-
-    bb = run(["scripts/xsection_book_cli.py", "--cycle", str(cycle),
-              "--n-per-side", str(_N_PER_SIDE), "--rebalance-every", str(_REBALANCE_EVERY)])
-    if not os.path.exists(os.path.join(cdir, "proposals.json")):
-        _capture_ban(_state, bb.stderr, bb.stdout)
-        save_outage(_state, cycle, "xsection_book_cli", bb.stderr)
-        longs, shorts = _book()
-        print(f"HOLD-ON-DATA-OUTAGE cycle {cycle}: xsection_book_cli produced no proposals — book "
-              f"held, retry next tick. LONG {'/'.join(longs)} vs SHORT {'/'.join(shorts)} | "
-              f"{_pnl_line()} | err: {bb.stderr.strip()[-300:]}")
-        return _exit_code(longs, shorts)
-    try:
-        d = json.loads(bb.stdout)
-        print(f"book: priced {d['priced']}/{d['universe']} | rebalancing {d['rebalancing']} | "
-              f"target L{d['book']['long']}/S{d['book']['short']} | open {d['open']} "
-              f"close {d['close']} hold {d['hold']}")
-    except Exception:  # noqa: BLE001
-        pass
-
-    run(["scripts/reclassify_cli.py", "--cycle", str(cycle)])
-
-    rep = _gate_exposure(cycle)
-    if rep is None:
-        longs, shorts = _book()
-        print(f"HOLD-ON-DATA-OUTAGE cycle {cycle}: gate produced no report (rate-limit/network "
-              f"mid-execute, or a parse issue) — book held, retry next tick. "
+        print(f"HOLD-LOCKED cycle {cycle}: another tick holds the run lock — standing down so "
+              f"the book keeps ONE writer (HARD RULE 8); nothing touched. "
               f"LONG {'/'.join(longs)} vs SHORT {'/'.join(shorts)} | {_pnl_line()}")
-        # "Book held" is only true when the gate died before touching anything. On a REBALANCE it
-        # can die AFTER its closes and before its opens, leaving the book badly one-sided — cy372
-        # ended L6/S9 at 23.65% net short and said nothing, because the post-gate guard reads a
-        # report that was never written. Measure the real book and shout if neutrality broke.
-        _alarm = neutrality_alarm(exposure_from_positions(_live_positions()))
-        if _alarm:
-            print(_alarm)
         return _exit_code(longs, shorts)
-    e = rep["exposure"]
-    print(f"gate: opened {rep['opened']} closed {rep['closed']} reduced {rep['reduced']} | "
-          f"net ${e['net']:+.0f} tilt {e['tilt']:.4f} L{e['n_long']}/S{e['n_short']} "
-          f"equity {rep['equity']:.2f} halt {rep['halted']}"
-          f"{_veto_reasons(_state, cycle)}")
+    try:
+        if not _still_due(_state, cycle):
+            longs, shorts = _book()
+            flat = not longs or not shorts
+            print(f"SKIP cycle {cycle} | {'FLAT! (VIOLATION)' if flat else 'deployed'} | "
+                  f"served by another tick while this one waited for the run lock | "
+                  f"LONG {'/'.join(longs)} vs SHORT {'/'.join(shorts)} | {_pnl_line()}")
+            return _exit_code(longs, shorts)
+        print(f"DUE cycle {cycle}: running deterministic blended tick")
 
-    # POST-GATE NEUTRALITY GUARD: a rotation into an asymmetric held book can leave it imbalanced.
-    rep2 = None
-    if e["n_long"] != e["n_short"] and not _guard_should_trim(e):
-        print(f"  note: book is L{e['n_long']}/S{e['n_short']} but dollar-neutral "
-              f"(tilt {e['tilt']:.4f}) — a short-handed side needs a REFILL, not a trim; "
-              f"the next cycle's plan fills it.")
-    if _guard_should_trim(e):
-        # snapshot FIRST — the guard's own gate pass overwrites report.json/proposals.json
-        _snapshot_pre_guard(cdir, rep)
-        gl, gs = e["gross_long"], e["gross_short"]
-        big, frac, capped = _guard_trim(
-            gl, gs, counts_balanced=e["n_long"] == e["n_short"])
-        if capped:
-            print(f"  GUARD CAPPED: neutralising would need "
-                  f"{abs(gs - gl) / max(gs, gl, 1e-9):.1%} off the {big} sleeve — that is a "
-                  f"MISSING LEG, not an oversized sleeve. Trimming {frac:.0%} instead and "
-                  f"leaving residual tilt for the next cycle's refill to close.")
-        ps = json.load(open(os.path.join(ROOT, "state", "positions.json")))
-        mgmt = []
-        for x in ps:
-            if x["direction"] == big and frac > 0:
-                mgmt.append({"symbol": x["symbol"], "action": "reduce", "reduce_fraction": frac,
-                             "note": "auto neutrality guard — trim oversized sleeve to neutral."})
-            else:
-                mgmt.append({"symbol": x["symbol"], "action": "hold", "note": "guard hold."})
-        json.dump({"proposals": [], "management": mgmt, "triggers": [], "cancel_triggers": []},
-                  open(os.path.join(cdir, "proposals.json"), "w"), indent=2)
-        print(f"NEUTRALITY GUARD: tilt {e['tilt']:.3f} -> trimming {big} sleeve by {frac}")
-        rep2 = _gate_exposure(cycle)
-        print(_guard_outcome_line(rep2, e["tilt"]))
+        # BAN GUARD (self-heal): if a prior fire recorded an ACTIVE -1003 IP ban, HOLD before
+        # touching the exchange — any fetch now would only re-extend the ban ~22min and it would
+        # never lapse (observed cy190: the ban ratcheted ahead of real time across rapid fires).
+        # Wait it out; the next fire landing after the deadline fetches cleanly. The 4h candle is
+        # still there to execute.
+        rem = _ban_remaining_ms(_state, cooldown_ms=_ban_cooldown_ms(_consecutive_bans(_state)))
+        if rem > 0:
+            raw = _ban_remaining_ms(_state)          # 0 once the ban itself has lapsed
+            why = (f"Binance -1003 ban still active for ~{raw // 60000}m — skipping scout "
+                   f"to let it lapse (no fetch = no re-extend)"
+                   if raw > 0 else
+                   f"ban lapsed; holding a further ~{rem // 60000}m quiet period before fetching "
+                   f"after {_consecutive_bans(_state)} consecutive bans "
+                   f"(each retry that draws a 418 extends the next ban)")
+            longs, shorts = _book()
+            book = f"LONG {'/'.join(longs)} vs SHORT {'/'.join(shorts)}"
+            print(f"HOLD-ON-DATA-OUTAGE cycle {cycle}: {why}, book held. {book} | {_pnl_line()}")
+            return _exit_code(longs, shorts)
 
-    longs, shorts = _book()
-    flat = not longs or not shorts
-    print(f"SUMMARY cycle {cycle} | {'FLAT! (VIOLATION)' if flat else 'deployed'} | "
-          f"LONG {'/'.join(longs)} vs SHORT {'/'.join(shorts)} | "
-          f"equity {_reported_equity(rep, rep2):.2f}"
-          f" | {_pnl_line(_reported_equity(rep, rep2))}")
+        # A DATA OUTAGE (Binance rate-limit 418/-1003, network) makes scout/preflight produce no
+        # file. That is transient, not a code bug: HOLD the book and retry next tick, never crash.
+        # The book is untouched — the gate has not run. The exit code reports the BOOK, not the
+        # outage: holding a balanced book exits 0 so the cron does not flag a transient fetch
+        # failure, but holding a NAKED one still exits _EXIT_FLAT. The violation does not stop being
+        # a violation because the tick that would have repaired it could not fetch prices — cy296
+        # held an L3/S0 book through a ban and reported success.
+        # WIDE UNIVERSE. The desk is now a cross-sectional factor book: breadth IS the edge.
+        # Measured over 230 perps x 2190 4h bars, the same momentum signal returns Sharpe 1.19 with
+        # a 35% drawdown at 3 legs/side and Sharpe 3.24 with a 13.5% drawdown at 20/side. Twelve
+        # names cannot support 40 legs, so the scout now ranks the top 100 by 24h volume.
+        sc = run(["scripts/scout_cli.py", "--cycle", str(cycle), "--top", "100"])
+        upath = os.path.join(cdir, "universe.json")
+        if not os.path.exists(upath):
+            # record any -1003 ban deadline so the NEXT fire holds before fetching (self-heal)
+            _bu = _capture_ban(_state, sc.stderr, sc.stdout)
+            longs, shorts = _book()
+            book = f"LONG {'/'.join(longs)} vs SHORT {'/'.join(shorts)}"
+            _bnote = f" (ban until {_bu}, holding next fires until it lapses)" if _bu else ""
+            print(f"HOLD-ON-DATA-OUTAGE cycle {cycle}: scout produced no universe (Binance "
+                  f"rate-limit/network){_bnote} — book held, retry next tick. {book} | "
+                  f"{_pnl_line()} | err: {sc.stderr.strip()[-160:]}")
+            return _exit_code(longs, shorts)
+        _clear_ban(_state)          # scout fetched cleanly -> the IP is good, reset the backoff
+        uni = json.load(open(upath))
+        uni_syms = [s["symbol"] for s in uni.get("universe", uni.get("candidates", []))]
+        symbols = list(dict.fromkeys(uni_syms + _held_symbols()))  # union, order-preserving
 
-    # Monthly review check (optional, runs every ~30 days)
-    _check_monthly_review()
+        # DATA BEFORE THE CYCLE (operator requirement, non-negotiable): warm every series through
+        # the local binance-proxy first, and refuse to trade a stale tape.
+        _tf = "4h"
+        _proxy = load_settings().exchange.klines_proxy_url
+        _warmed, _stale, _werr = _warm_klines(
+            [s.split("/")[0] + "USDT" for s in symbols], _tf, _proxy)
+        print(f"warm: {_warmed}/{len(symbols)} series via proxy {_proxy or '(none)'}"
+              + (f" | stale: {'/'.join(x.replace('USDT', '') for x in _stale)}" if _stale else "")
+              + (f" | err: {_werr}" if _werr else ""))
+        if _stale:
+            longs, shorts = _book()
+            print(f"HOLD-ON-STALE-DATA cycle {cycle}: {len(_stale)} of {len(symbols)} series are "
+                  f"older than {_MAX_AGE_INTERVALS} x {_tf} — refusing to size a book on a "
+                  f"stale tape. "
+                  f"book held. LONG {'/'.join(longs)} vs SHORT {'/'.join(shorts)} | {_pnl_line()}")
+            return _exit_code(longs, shorts)
 
-    return _exit_code(longs, shorts)
+        pf = run(["scripts/preflight.py", "--cycle", str(cycle), "--symbols", ",".join(symbols)])
+        if not os.path.exists(os.path.join(cdir, "context.json")):
+            _bu = _capture_ban(_state, pf.stderr, pf.stdout)
+            save_outage(_state, cycle, "preflight", pf.stderr)
+            longs, shorts = _book()
+            _bnote = f" (ban until {_bu}, holding next fires until it lapses)" if _bu else ""
+            print(f"HOLD-ON-DATA-OUTAGE cycle {cycle}: preflight produced no context (rate-limit/"
+                  f"network){_bnote} — book held, retry next tick. "
+                  f"LONG {'/'.join(longs)} vs SHORT {'/'.join(shorts)} | "
+                  f"{_pnl_line()} | err: {pf.stderr.strip()[-200:]}")
+            return _exit_code(longs, shorts)
+        try:
+            _exits = exit_lines(json.load(open(os.path.join(cdir, "context.json"))))
+        except Exception:  # noqa: BLE001 — reporting only
+            _exits = ""
+        if _exits:
+            print(_exits)
+
+        # deterministic news-neutral overlay (regime engine flags risk_off independently; blended
+        # engine excludes pumps deterministically) -> satisfies the gate funnel + reclassify without
+        # any LLM.
+        raw = [s.split("/")[0] + "USDT" for s in symbols]
+        reps = [{"agent": "news", "symbol": s, "stance": "neutral", "confidence": 0.3,
+                 "key_points": ["Deterministic auto-cycle: no LLM news read; regime engine sets "
+                                "risk, blended engine excludes pumps."],
+                 "signals": {"catalyst_count": 0, "risk_off_flag": 0}} for s in raw]
+        json.dump(reps, open(os.path.join(cdir, "analyst_reports.json"), "w"), indent=2)
+
+        bb = run(["scripts/xsection_book_cli.py", "--cycle", str(cycle),
+                  "--n-per-side", str(_N_PER_SIDE), "--rebalance-every", str(_REBALANCE_EVERY)])
+        if not os.path.exists(os.path.join(cdir, "proposals.json")):
+            _capture_ban(_state, bb.stderr, bb.stdout)
+            save_outage(_state, cycle, "xsection_book_cli", bb.stderr)
+            longs, shorts = _book()
+            print(f"HOLD-ON-DATA-OUTAGE cycle {cycle}: xsection_book_cli produced no proposals "
+                  f"— book held, retry next tick. "
+                  f"LONG {'/'.join(longs)} vs SHORT {'/'.join(shorts)} | "
+                  f"{_pnl_line()} | err: {bb.stderr.strip()[-300:]}")
+            return _exit_code(longs, shorts)
+        try:
+            d = json.loads(bb.stdout)
+            print(f"book: priced {d['priced']}/{d['universe']} | rebalancing {d['rebalancing']} | "
+                  f"target L{d['book']['long']}/S{d['book']['short']} | open {d['open']} "
+                  f"close {d['close']} hold {d['hold']}")
+        except Exception:  # noqa: BLE001
+            pass
+
+        run(["scripts/reclassify_cli.py", "--cycle", str(cycle)])
+
+        rep = _gate_exposure(cycle)
+        if rep is None:
+            longs, shorts = _book()
+            print(f"HOLD-ON-DATA-OUTAGE cycle {cycle}: gate produced no report (rate-limit/network "
+                  f"mid-execute, or a parse issue) — book held, retry next tick. "
+                  f"LONG {'/'.join(longs)} vs SHORT {'/'.join(shorts)} | {_pnl_line()}")
+            # "Book held" is only true when the gate died before touching anything. On a REBALANCE
+            # it can die AFTER its closes and before its opens, leaving the book badly one-sided —
+            # cy372 ended L6/S9 at 23.65% net short and said nothing, because the post-gate guard
+            # reads a report that was never written. Measure the real book and shout if neutrality
+            # broke.
+            _alarm = neutrality_alarm(exposure_from_positions(_live_positions()))
+            if _alarm:
+                print(_alarm)
+            return _exit_code(longs, shorts)
+        e = rep["exposure"]
+        print(f"gate: opened {rep['opened']} closed {rep['closed']} reduced {rep['reduced']} | "
+              f"net ${e['net']:+.0f} tilt {e['tilt']:.4f} L{e['n_long']}/S{e['n_short']} "
+              f"equity {rep['equity']:.2f} halt {rep['halted']}"
+              f"{_veto_reasons(_state, cycle)}")
+
+        # POST-GATE NEUTRALITY GUARD: a rotation into an asymmetric held book can leave it
+        # imbalanced.
+        rep2 = None
+        if e["n_long"] != e["n_short"] and not _guard_should_trim(e):
+            print(f"  note: book is L{e['n_long']}/S{e['n_short']} but dollar-neutral "
+                  f"(tilt {e['tilt']:.4f}) — a short-handed side needs a REFILL, not a trim; "
+                  f"the next cycle's plan fills it.")
+        if _guard_should_trim(e):
+            # snapshot FIRST — the guard's own gate pass overwrites report.json/proposals.json
+            _snapshot_pre_guard(cdir, rep)
+            gl, gs = e["gross_long"], e["gross_short"]
+            big, frac, capped = _guard_trim(
+                gl, gs, counts_balanced=e["n_long"] == e["n_short"])
+            if capped:
+                print(f"  GUARD CAPPED: neutralising would need "
+                      f"{abs(gs - gl) / max(gs, gl, 1e-9):.1%} off the {big} sleeve — that is a "
+                      f"MISSING LEG, not an oversized sleeve. Trimming {frac:.0%} instead and "
+                      f"leaving residual tilt for the next cycle's refill to close.")
+            ps = json.load(open(os.path.join(ROOT, "state", "positions.json")))
+            mgmt = []
+            for x in ps:
+                if x["direction"] == big and frac > 0:
+                    mgmt.append({"symbol": x["symbol"], "action": "reduce", "reduce_fraction": frac,
+                                 "note": "auto neutrality guard — trim oversized sleeve "
+                                         "to neutral."})
+                else:
+                    mgmt.append({"symbol": x["symbol"], "action": "hold", "note": "guard hold."})
+            json.dump({"proposals": [], "management": mgmt, "triggers": [], "cancel_triggers": []},
+                      open(os.path.join(cdir, "proposals.json"), "w"), indent=2)
+            print(f"NEUTRALITY GUARD: tilt {e['tilt']:.3f} -> trimming {big} sleeve by {frac}")
+            rep2 = _gate_exposure(cycle)
+            print(_guard_outcome_line(rep2, e["tilt"]))
+
+        longs, shorts = _book()
+        flat = not longs or not shorts
+        print(f"SUMMARY cycle {cycle} | {'FLAT! (VIOLATION)' if flat else 'deployed'} | "
+              f"LONG {'/'.join(longs)} vs SHORT {'/'.join(shorts)} | "
+              f"equity {_reported_equity(rep, rep2):.2f}"
+              f" | {_pnl_line(_reported_equity(rep, rep2))}")
+
+        # Monthly review check (optional, runs every ~30 days)
+        _check_monthly_review()
+
+        return _exit_code(longs, shorts)
+    finally:
+        tick_lock.release()
 
 
 if __name__ == "__main__":

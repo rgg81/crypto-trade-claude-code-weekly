@@ -124,6 +124,52 @@ def test_single_flight_yields_false_when_held(tmp_path):
     assert try_acquire(tmp_path, now)[0] is False
 
 
+# ---- lease refresh + owned release (auto_cycle holds the lock across a multi-minute tick) --------
+
+def test_refresh_keeps_a_long_running_holder_from_being_reclaimed(tmp_path):
+    """A DUE tick can legitimately outlast the 30-min stale window (60s warm timeouts x ~100
+    symbols against a stalled proxy). Without a refresh, a second tick reclaims mid-execute."""
+    from futures_fund.runlock import refresh
+    start = datetime(2026, 6, 8, 12, 0, tzinfo=UTC)
+    assert try_acquire(tmp_path, start)[0] is True
+    assert refresh(tmp_path, start + timedelta(minutes=25)) is True
+    assert try_acquire(tmp_path, start + timedelta(minutes=45))[0] is False, \
+        "20 minutes after the refresh the holder is live, not stale"
+
+
+def test_refresh_never_takes_over_another_processs_lock(tmp_path):
+    from futures_fund.runlock import LOCK_NAME, refresh
+    start = datetime(2026, 6, 8, 12, 0, tzinfo=UTC)
+    lock = tmp_path / LOCK_NAME
+    lock.write_text('{"pid": 999999999, "owner": "other", "start_ts": "2026-06-08T12:00:00+00:00"}')
+    before = lock.read_text()
+    assert refresh(tmp_path, start + timedelta(minutes=5)) is False
+    assert lock.read_text() == before
+
+
+def test_refresh_never_creates_a_lock(tmp_path):
+    from futures_fund.runlock import LOCK_NAME, refresh
+    assert refresh(tmp_path, datetime(2026, 6, 8, 12, 0, tzinfo=UTC)) is False
+    assert not (tmp_path / LOCK_NAME).exists()
+
+
+def test_owned_release_leaves_a_reclaimed_lock_alone(tmp_path):
+    """A holder whose lease lapsed and was legitimately reclaimed must not delete the NEW holder's
+    lock on its way out — that would let a third tick run beside the second."""
+    from futures_fund.runlock import LOCK_NAME, release_if_owned
+    lock = tmp_path / LOCK_NAME
+    lock.write_text('{"pid": 999999999, "owner": "other", "start_ts": "2026-06-08T12:00:00+00:00"}')
+    assert release_if_owned(tmp_path) is False
+    assert lock.exists()
+
+
+def test_owned_release_removes_our_own_lock(tmp_path):
+    from futures_fund.runlock import LOCK_NAME, release_if_owned
+    assert try_acquire(tmp_path, datetime(2026, 6, 8, 12, 0, tzinfo=UTC))[0] is True
+    assert release_if_owned(tmp_path) is True
+    assert not (tmp_path / LOCK_NAME).exists()
+
+
 def test_cli_acquire_hold_release_cycle(tmp_path):
     # the strategic loop holds the lock ACROSS processes: acquire -> (cycle) -> release
     s = str(tmp_path)

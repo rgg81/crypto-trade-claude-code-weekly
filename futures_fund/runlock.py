@@ -122,6 +122,42 @@ def release(state_dir) -> None:
         pass
 
 
+def _owned_holder(lock: Path, pid: int | None) -> dict | None:
+    holder = _read(lock)
+    mine = os.getpid() if pid is None else pid
+    return holder if isinstance(holder, dict) and holder.get("pid") == mine else None
+
+
+def refresh(state_dir, now: datetime, *, pid: int | None = None) -> bool:
+    """Extend the lease of a lock THIS process holds by re-stamping its start_ts to `now`.
+
+    A holder is reclaimable once `stale_after_s` passes, which is right for a crashed run and wrong
+    for a live one: auto_cycle holds the lock across a whole tick, and a tick against a stalled
+    proxy can outlast 30 minutes. Refreshing keeps a LIVE holder live. It never creates a lock and
+    never touches another process's — a lease that already lapsed and was reclaimed stays reclaimed.
+    The rewrite is atomic (write-then-replace) so a concurrent reader never sees a torn file."""
+    lock = Path(state_dir) / LOCK_NAME
+    holder = _owned_holder(lock, pid)
+    if holder is None:
+        return False
+    tmp = lock.with_name(f"{LOCK_NAME}.{os.getpid()}.tmp")
+    tmp.write_text(json.dumps({**holder, "start_ts": now.isoformat()}))
+    os.replace(tmp, lock)
+    return True
+
+
+def release_if_owned(state_dir, *, pid: int | None = None) -> bool:
+    """Release the lock only if THIS process still holds it. True if removed.
+
+    `release` unlinks unconditionally, which is safe inside `single_flight` (the block cannot
+    outlive its own lease) but not for a long holder: if its lease lapsed and another run
+    reclaimed the lock, an unconditional release would delete the NEW holder's lock and let a
+    third run in beside it."""
+    lock = Path(state_dir) / LOCK_NAME
+    holder = _owned_holder(lock, pid)
+    return holder is not None and _unlink_if_same(lock, holder)
+
+
 @contextmanager
 def single_flight(state_dir, now: datetime, *, owner: str = "runner",
                   stale_after_s: float = DEFAULT_STALE_AFTER_S):
