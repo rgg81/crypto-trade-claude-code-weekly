@@ -148,13 +148,31 @@ def execute_proposals(  # noqa: PLR0912
     # symbols[0] is the market bellwether (convention: BTC first) for the portfolio heat cap;
     # per-proposal gating below still uses each symbol's own regime.
     caps = caps_for(simple_regime(ctx.frames[ctx.settings.symbols[0]]), health)
-    open_dicts = [{"symbol": p.symbol, "direction": p.direction, "qty": p.qty,
-                   "entry": p.entry, "stop": p.stop} for p in positions]
 
     from futures_fund.equity_log import period_return
     daily_pnl = period_return(state_dir, now, 1)
     weekly_pnl = period_return(state_dir, now, 7)
     monthly_pnl = period_return(state_dir, now, 30)
+
+    force_close = set(force_close or set())
+    # Hard circuit breaker: a -50% drawdown FLATTENS the entire book — close every holding at mark
+    # this cycle, regardless of the review's per-position verdicts. (Drawdown-tolerant weekly desk.)
+    breaker = circuit_breaker(daily_pnl, weekly_pnl, monthly_pnl, health.drawdown_from_peak)
+    if breaker.force_flatten:
+        force_close |= {p.symbol for p in positions}
+        report["force_flatten"] = breaker.reason
+    # A force_close position is only genuinely closeable if priceable; otherwise it stays open
+    # (stuck) and its heat must still be reserved so the gross-heat cap binds on the REAL book.
+    closeable = {p.symbol for p in positions if p.symbol in force_close
+                 and ctx.raw_to_unified.get(p.symbol) is not None and p.symbol in ctx.prices}
+    # Heat-check each open against the book that will EXIST after this cycle's closes — the same
+    # survivors `consolidate` reserves for below. Counting the legs being closed vetoed opens
+    # against heat that was about to vanish: cy456 refused 11 of 14 rebalance opens at "used 0.088
+    # >= cap 0.080" when the post-rotation book carried 0.064. A stuck (unpriceable) close is not
+    # closeable, so its heat still counts; no cap moves.
+    open_dicts = [{"symbol": p.symbol, "direction": p.direction, "qty": p.qty,
+                   "entry": p.entry, "stop": p.stop}
+                  for p in positions if p.symbol not in closeable]
 
     approved = []
     vetoed: list = []
@@ -176,17 +194,6 @@ def execute_proposals(  # noqa: PLR0912
                            "take_profits": prop.take_profits, "reason": decision.reason})
 
     cvar_mult = cvar_risk_multiplier(_recent_returns(memory_dir, health.equity))
-    force_close = set(force_close or set())
-    # Hard circuit breaker: a -50% drawdown FLATTENS the entire book — close every holding at mark
-    # this cycle, regardless of the review's per-position verdicts. (Drawdown-tolerant weekly desk.)
-    breaker = circuit_breaker(daily_pnl, weekly_pnl, monthly_pnl, health.drawdown_from_peak)
-    if breaker.force_flatten:
-        force_close |= {p.symbol for p in positions}
-        report["force_flatten"] = breaker.reason
-    # A force_close position is only genuinely closeable if priceable; otherwise it stays open
-    # (stuck) and its heat must still be reserved so the gross-heat cap binds on the REAL book.
-    closeable = {p.symbol for p in positions if p.symbol in force_close
-                 and ctx.raw_to_unified.get(p.symbol) is not None and p.symbol in ctx.prices}
     # Reserve gross heat for every carried position that SURVIVES this cycle (kept holdings +
     # any stuck force-close) so new opens get only the remaining headroom under the cap.
     reserved = 0.0 if close_absent else sum(
