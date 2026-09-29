@@ -97,7 +97,13 @@ def test_the_planner_never_opens_a_wide_stop_name():
             p = os.path.join("state", "cycle", "307", extra)
             if os.path.exists(p):
                 shutil.copy(p, cdir)
-        shutil.copy("state/positions.json", td)
+        # An EMPTY book, never the live one: copying state/positions.json paired these frozen cy307
+        # prices with whatever the desk holds today, and once the live book held BTW the planner
+        # (legitimately) re-listed that holding, so the test failed on drift, not on the filter.
+        # With no holdings BTW is a pure candidate, so this still fails if the filter is disabled
+        # (verified 2026-09-29: the mutant puts BTWUSDT in open_short in place of XRPUSDT).
+        with open(os.path.join(td, "positions.json"), "w") as f:
+            json.dump([], f)
         r = subprocess.run([sys.executable, "scripts/blended_book_cli.py", "--cycle", "307",
                             "--state", td], capture_output=True, text=True)
         assert r.returncode == 0, r.stderr[-2000:]
