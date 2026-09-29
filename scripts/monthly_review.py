@@ -25,6 +25,19 @@ import numpy as np
 from futures_fund.costs import trade_fee
 from futures_fund.journal import read_all_decisions
 
+# One cycle per 4h candle. Cycle folders carry no timestamp, so the review window is a cycle
+# count; unserved candles (restarts, bans) make it cover slightly MORE calendar time, never less.
+CYCLES_PER_DAY = 6
+
+
+def _last_days(cycles: list[dict], days: int) -> list[dict]:
+    """Keep the cycles in the last `days` days, by cycle NUMBER so a missing folder can't widen
+    the window. `days <= 0` keeps the whole history."""
+    if not days or days <= 0 or not cycles:
+        return cycles
+    last = max(c["cycle"] for c in cycles)
+    return [c for c in cycles if c["cycle"] > last - days * CYCLES_PER_DAY]
+
 
 def load_cycle_equity_curve(days: int, state_dir: Path = Path("state")) -> list[dict]:
     """Load equity curve from cycle data.
@@ -42,7 +55,7 @@ def load_cycle_equity_curve(days: int, state_dir: Path = Path("state")) -> list[
     equity_log = state_dir / "equity_log.json"
     if equity_log.exists():
         with open(equity_log) as f:
-            return json.load(f)
+            return _last_days(json.load(f), days)
 
     # Otherwise, build from cycle folders
     cycles = []
@@ -70,7 +83,7 @@ def load_cycle_equity_curve(days: int, state_dir: Path = Path("state")) -> list[
             "time": cycle_time,
         })
 
-    return cycles
+    return _last_days(cycles, days)
 
 
 def compute_performance_metrics(cycles: list[dict]) -> dict:
@@ -86,7 +99,7 @@ def compute_performance_metrics(cycles: list[dict]) -> dict:
     total_return_pct = (final_equity - init_equity) / init_equity * 100
 
     # Monthly return (at 4h cadence: 6 cycles/day = 180 cycles/month)
-    cycles_per_month = 180.0
+    cycles_per_month = 30.0 * CYCLES_PER_DAY
     months = len(cycles) / cycles_per_month
     if months > 0:
         monthly_return_pct = total_return_pct / months
