@@ -924,7 +924,9 @@ def main() -> int:
             return _exit_code(longs, shorts)
         try:
             d = json.loads(bb.stdout)
-            print(f"book: priced {d['priced']}/{d['universe']} | rebalancing {d['rebalancing']} | "
+            _why = f" ({d['rebalance_reason']})" if d.get("rebalance_reason") else ""
+            print(f"book: priced {d['priced']}/{d['universe']} | "
+                  f"rebalancing {d['rebalancing']}{_why} | "
                   f"target L{d['book']['long']}/S{d['book']['short']} | open {d['open']} "
                   f"close {d['close']} hold {d['hold']}")
         except Exception:  # noqa: BLE001

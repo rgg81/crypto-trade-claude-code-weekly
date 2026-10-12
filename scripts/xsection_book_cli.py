@@ -20,8 +20,11 @@ import os
 import sys
 import urllib.parse
 import urllib.request
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 from futures_fund.blended_score import admissible_stop_frac
+from futures_fund.scheduling import _parse_utc, _served_candle, floor_tf
 from futures_fund.xsection import (
     MOM_LOOKBACK,
     PUMP_CAP,
@@ -342,6 +345,67 @@ def risk_mults(weights: dict[str, float], stop_frac: dict[str, float]) -> dict[s
     return out
 
 
+# REBALANCE CADENCE. "Daily" means a day of CANDLES since the last rebalance the desk COMPLETED, not
+# every 6th cycle NUMBER. Cycle numbers count SERVED ticks, so each unserved candle (machine
+# asleep, session down, ban) pushed `cycle % 6` one candle later. After the 2026-10-07..12 outage
+# (29 candles unserved) that rule held the cy576 ranking ~5.7 days. Each cycle records its decision
+# in PLAN_FILE; cycles from before the marker existed are read with the old modulo rule they
+# actually ran under.
+PLAN_FILE = "xsection_plan.json"
+TF_MINUTES = 240
+
+
+def _rebalanced(cdir: Path, n: int, every: int) -> bool:
+    """Did cycle `n` rebalance? Its own marker when it wrote one, else the legacy modulo rule."""
+    try:
+        return bool(json.loads((cdir / PLAN_FILE).read_text())["rebalancing"])
+    except (OSError, ValueError, KeyError, TypeError):
+        return n % every == 0
+
+
+def last_rebalance(state_dir, cycle: int, *, every: int, now_utc: datetime,
+                   tf_minutes: int = TF_MINUTES) -> tuple[int, datetime] | None:
+    """(cycle, served candle) of the newest rebalance BEFORE `cycle` that completed.
+
+    Completed = its report.json exists and parses (the gate ran). A planned rebalance whose gate
+    never reported did not happen. `cycle` itself is excluded: a RETRY re-runs the same number over
+    a crashed folder that may already hold a marker."""
+    root = Path(state_dir) / "cycle"
+    if not root.exists():
+        return None
+    dirs = sorted((int(p.name) for p in root.glob("*")
+                   if p.is_dir() and p.name.isdigit() and int(p.name) < cycle), reverse=True)
+    for n in dirs:
+        rp = root / str(n) / "report.json"
+        if not rp.exists():
+            continue
+        candle = _served_candle(rp, now_utc, tf_minutes)
+        if candle is not None and _rebalanced(root / str(n), n, every):
+            return n, candle
+    return None
+
+
+def rebalance_due(state_dir, cycle: int, now_utc: datetime, *, every: int = 6,
+                  tf_minutes: int = TF_MINUTES) -> tuple[bool, str]:
+    """Rebalance once `every` candles have passed since the last completed rebalance.
+
+    Matches `cycle % every == 0` under uninterrupted service, never fires twice inside `every`
+    candles, and rebalances on the first tick after an outage. With no rebalance on record, or on
+    any read error, it falls back to the legacy modulo rule."""
+    every = max(1, every)
+    try:
+        last = last_rebalance(state_dir, cycle, every=every, now_utc=now_utc,
+                              tf_minutes=tf_minutes)
+    except Exception as exc:  # noqa: BLE001 - a history read must never stop the book
+        return cycle % every == 0, f"history unreadable ({type(exc).__name__}) - cycle % {every}"
+    if last is None:
+        return cycle % every == 0, f"no completed rebalance on record - cycle % {every}"
+    n, candle = last
+    gap = int((floor_tf(now_utc, tf_minutes) - candle) / timedelta(minutes=tf_minutes))
+    return gap >= every, (f"{gap} candles since the cy{n} rebalance @ {candle:%m-%d %H:%MZ} "
+                          f"(due at {every})")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--cycle", type=int, required=True)
@@ -349,7 +413,9 @@ def main() -> None:
     ap.add_argument("--n-per-side", type=int, default=20)
     ap.add_argument("--rebalance-every", type=int, default=6)   # 6 x 4h = daily
     ap.add_argument("--drift-band", type=float, default=0.25)
+    ap.add_argument("--now", default=None, help="ISO UTC instant (tests); default: the clock")
     args = ap.parse_args()
+    now = _parse_utc(args.now) or datetime.now(UTC)
 
     cdir = os.path.join(args.state, "cycle", str(args.cycle))
     os.makedirs(cdir, exist_ok=True)
@@ -420,7 +486,8 @@ def main() -> None:
 
     weights = cross_sectional_weights(series, n_per_side=n_side,
                                       vol_floor=VOL_FLOOR, pump_cap=PUMP_CAP)
-    rebalancing = (args.cycle % max(1, args.rebalance_every)) == 0
+    rebalancing, rebalance_reason = rebalance_due(args.state, args.cycle, now,
+                                                  every=args.rebalance_every)
 
     proposals, allocations, management = [], [], []
     plan = {"target_long": [], "target_short": [], "open": [], "close": [], "hold": []}
@@ -489,9 +556,15 @@ def main() -> None:
              "cancel_triggers": []}
     json.dump(cio, open(os.path.join(cdir, "cio.json"), "w"), indent=2)
     json.dump(props, open(os.path.join(cdir, "proposals.json"), "w"), indent=2)
+    # The cadence marker: whether this cycle ACTUALLY rebalanced (a due cycle with no weights did
+    # not). rebalance_due() reads it back, and counts it only once the gate's report.json exists.
+    json.dump({"cycle": args.cycle, "rebalancing": bool(weights and rebalancing),
+               "reason": rebalance_reason, "candle": floor_tf(now, TF_MINUTES).isoformat(),
+               "plan": plan}, open(os.path.join(cdir, PLAN_FILE), "w"), indent=2)
     print(json.dumps({
         "universe": len(symbols), "priced": len(series), "failed": failed[:5],
-        "rebalancing": rebalancing, "n_per_side": n_side, "heat": heat_note,
+        "rebalancing": rebalancing, "rebalance_reason": rebalance_reason,
+        "n_per_side": n_side, "heat": heat_note,
         "book": {"long": len(plan["target_long"]), "short": len(plan["target_short"])},
         "open": len(plan["open"]), "close": len(plan["close"]), "hold": len(plan["hold"]),
         "wrote": [f"{cdir}/cio.json", f"{cdir}/proposals.json"]}, indent=2))
