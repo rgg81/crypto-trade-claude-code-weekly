@@ -961,7 +961,7 @@ def main() -> int:
         if e["n_long"] != e["n_short"] and not _guard_should_trim(e):
             print(f"  note: book is L{e['n_long']}/S{e['n_short']} but dollar-neutral "
                   f"(tilt {e['tilt']:.4f}) — a short-handed side needs a REFILL, not a trim; "
-                  f"the next cycle's plan fills it.")
+                  f"the next REBALANCE fills it (off-rebalance cycles hold the book).")
         if _guard_should_trim(e):
             # snapshot FIRST — the guard's own gate pass overwrites report.json/proposals.json
             _snapshot_pre_guard(cdir, rep)

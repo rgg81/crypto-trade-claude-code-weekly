@@ -13,7 +13,7 @@ limits still apply. Symmetric: identical treatment for longs and shorts.
 """
 from __future__ import annotations
 
-ENTRY_TOL_MARKET = 0.05    # a MARKET open's entry must be within 5% of the brief's last_close
+ENTRY_TOL_MARKET = 0.05    # a MARKET open's entry must be within 5% of the brief's live mark
 TRIGGER_TOL = 0.25         # a breakout/breakdown TRIGGER level may sit further (<=25%) from mark
 ATR_LO, ATR_HI = 0.4, 2.5  # agent atr must be within [0.4x, 2.5x] the brief's computed atr
 
@@ -25,9 +25,29 @@ def _finite_pos(x) -> bool:
         return False
 
 
+def ground_truth_from_briefs(briefs) -> dict:
+    """{raw symbol: {"mark", "atr"}} from the context briefs. "mark" is the LIVE `mark_price`, with
+    `last_close` as the fallback.
+
+    The live mark is the market the entry will fill against. `last_close` is the close of the last
+    CLOSED candle, up to a full candle stale (more on a late tick). Against it, any name that moved
+    over 5% inside the forming candle was dropped as "fabricated" with its entry ~0.5% from the
+    live mark. Six factor rebalances (cy462-585) each lost a leg that way, mostly momentum longs."""
+    out: dict = {}
+    for b in briefs or []:
+        sym = b.get("exchange_id")
+        if not sym:
+            continue
+        mark = b.get("mark_price")
+        out[sym] = {"mark": mark if _finite_pos(mark) else b.get("last_close"),
+                    "atr": b.get("atr")}
+    return out
+
+
 def audit_entry(entry, mark, *, is_trigger: bool) -> tuple[bool, str]:
-    """Entry must be near the brief's last_close it was derived from. Triggers (breakout/breakdown/
-    pullback levels) get a wider band than market opens. FAIL-OPEN if mark/entry missing."""
+    """Entry must be near the brief's live mark (see ground_truth_from_briefs). Triggers
+    (breakout/breakdown/pullback levels) get a wider band than market opens. FAIL-OPEN if
+    mark/entry missing."""
     if not _finite_pos(mark) or not _finite_pos(entry):
         return True, ""
     tol = TRIGGER_TOL if is_trigger else ENTRY_TOL_MARKET

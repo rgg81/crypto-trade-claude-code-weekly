@@ -83,10 +83,8 @@ def main() -> None:
     try:
         _ctx = load_output("state", args.cycle, "context")
         regime_state = _ctx.get("regime_state") or _DEGRADED
-        for b in _ctx.get("briefs", []):
-            sym = b.get("exchange_id")
-            if sym:
-                ground_truth[sym] = {"mark": b.get("last_close"), "atr": b.get("atr")}
+        from futures_fund.proposal_audit import ground_truth_from_briefs
+        ground_truth = ground_truth_from_briefs(_ctx.get("briefs", []))
     except FileNotFoundError:
         print("WARNING: context.json missing — regime UNREAD; fail-closed (both directions must "
               "confirm via trigger, no naked market entry).", file=sys.stderr)
