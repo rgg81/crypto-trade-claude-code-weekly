@@ -517,6 +517,14 @@ def main() -> None:
                                     "thesis": f"held factor leg, weight {w:+.4f}",
                                     "falsifiable_prediction": "leg stays in its sleeve"})
                 continue
+            if holdings.get(sym) == direction:
+                # A restrike must CLOSE the held leg too: the gate keeps every same-side holding it
+                # was not told to close, so an open alone was a silent no-op. Worse, it was a
+                # phantom open that the pre-sizer balanced against (cy591: SOL, tilt 0.035, guard
+                # trimmed every long). A force-closed symbol re-proposed this cycle is a fresh open.
+                plan["close"].append(sym)
+                management.append({"symbol": sym, "action": "close",
+                                   "note": "stale-stop restrike: reopened at the policy stop"})
             plan["open"].append(sym)
             st = structure(last[sym], atrs[sym], direction)
             thesis = (f"cross-sectional momentum({MOM_LOOKBACK} bars) factor leg, target weight "
